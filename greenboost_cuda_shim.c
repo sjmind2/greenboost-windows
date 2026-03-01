@@ -289,7 +289,7 @@ static CUresult gb_import_as_cuda_ptr(CUdeviceptr *dptr, size_t bytesize,
 __attribute__((constructor))
 static void gb_shim_init(void)
 {
-    void *libcuda, *libcudart;
+    void *libcuda, *libcudart = NULL;
     const char *env;
     uint32_t i;
 
@@ -312,8 +312,28 @@ static void gb_shim_init(void)
         return;
     }
 
-    libcudart = dlopen("libcudart.so", RTLD_NOW | RTLD_GLOBAL);
+    /* libcudart is Ollama-bundled — try versioned/Ollama-specific paths */
+    {
+        static const char *cudart_paths[] = {
+            "libcudart.so",
+            "libcudart.so.13",
+            "libcudart.so.12",
+            "/usr/local/lib/ollama/cuda_v13/libcudart.so.13.0.96",
+            "/usr/local/lib/ollama/mlx_cuda_v13/libcudart.so",
+            "/usr/local/lib/ollama/cuda_v12/libcudart.so.12",
+            NULL
+        };
+        const char **p;
+        for (p = cudart_paths; *p && !libcudart; p++) {
+            libcudart = dlopen(*p, RTLD_NOW | RTLD_GLOBAL);
+            if (libcudart)
+                fprintf(stderr, "[GreenBoost] libcudart loaded: %s\n", *p);
+        }
+        if (!libcudart)
+            fprintf(stderr, "[GreenBoost] WARNING: libcudart not found — runtime API resolved lazily\n");
+    }
 
+    /* Driver API (cu*) — always from libcuda.so.1 */
     real_cuMemAlloc_v2     = (pfn_cuMemAlloc_v2)     dlsym(libcuda, "cuMemAlloc_v2");
     real_cuMemFree_v2      = (pfn_cuMemFree_v2)      dlsym(libcuda, "cuMemFree_v2");
     real_cuMemAllocManaged = (pfn_cuMemAllocManaged)  dlsym(libcuda, "cuMemAllocManaged");
@@ -322,12 +342,13 @@ static void gb_shim_init(void)
     if (!real_cuMemGetInfo)
         real_cuMemGetInfo  = (pfn_cuMemGetInfo)       dlsym(libcuda, "cuMemGetInfo");
 
-    real_cudaMalloc        = (pfn_cudaMalloc)         dlsym(libcuda, "cudaMalloc");
-    real_cudaFree          = (pfn_cudaFree)           dlsym(libcuda, "cudaFree");
-    real_cudaMallocManaged = (pfn_cudaMallocManaged)  dlsym(libcuda, "cudaMallocManaged");
-    real_cudaMallocAsync   = (pfn_cudaMallocAsync)    dlsym(libcuda, "cudaMallocAsync");
-
+    /* Runtime API (cuda*) — live in libcudart, not libcuda */
     if (libcudart) {
+        real_cudaMalloc        = (pfn_cudaMalloc)        dlsym(libcudart, "cudaMalloc");
+        real_cudaFree          = (pfn_cudaFree)           dlsym(libcudart, "cudaFree");
+        real_cudaMallocManaged = (pfn_cudaMallocManaged)  dlsym(libcudart, "cudaMallocManaged");
+        real_cudaMallocAsync   = (pfn_cudaMallocAsync)    dlsym(libcudart, "cudaMallocAsync");
+
         real_cudaImportExternalMemory        = (pfn_cudaImportExternalMemory)
             dlsym(libcudart, "cudaImportExternalMemory");
         real_cudaExternalMemoryGetMappedBuffer = (pfn_cudaExternalMemoryGetMappedBuffer)
@@ -335,6 +356,11 @@ static void gb_shim_init(void)
         real_cudaDestroyExternalMemory       = (pfn_cudaDestroyExternalMemory)
             dlsym(libcudart, "cudaDestroyExternalMemory");
     }
+    /* Fallback: some CUDA versions export runtime wrappers from libcuda.so.1 */
+    if (!real_cudaMalloc)        real_cudaMalloc        = (pfn_cudaMalloc)        dlsym(libcuda, "cudaMalloc");
+    if (!real_cudaFree)          real_cudaFree          = (pfn_cudaFree)           dlsym(libcuda, "cudaFree");
+    if (!real_cudaMallocManaged) real_cudaMallocManaged = (pfn_cudaMallocManaged)  dlsym(libcuda, "cudaMallocManaged");
+    if (!real_cudaMallocAsync)   real_cudaMallocAsync   = (pfn_cudaMallocAsync)    dlsym(libcuda, "cudaMallocAsync");
 
     if (!real_cuMemAlloc_v2 || !real_cuMemFree_v2) {
         fprintf(stderr, "[GreenBoost] WARNING: failed to resolve core CUDA symbols\n");
@@ -425,7 +451,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize)
     CUresult ret;
 
     if (!initialized || !real_cuMemAlloc_v2)
-        return CUDA_SUCCESS;
+        return CUDA_ERROR_OUT_OF_MEMORY;
 
     if (gb_needs_overflow(bytesize)) {
         ret = gb_overflow_alloc(dptr, bytesize);
@@ -471,8 +497,12 @@ CUresult cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream)
 {
     CUresult ret;
 
-    if (!initialized || !real_cuMemAllocAsync)
-        return CUDA_SUCCESS;
+    if (!initialized)
+        return CUDA_ERROR_OUT_OF_MEMORY;
+
+    /* Fall back to sync cuMemAlloc_v2 if async driver API not available */
+    if (!real_cuMemAllocAsync)
+        return cuMemAlloc_v2(dptr, bytesize);
 
     if (gb_needs_overflow(bytesize)) {
         ret = gb_overflow_alloc(dptr, bytesize);
@@ -495,8 +525,15 @@ cudaError_t cudaMalloc(void **devPtr, size_t size)
     cudaError_t ret;
     CUdeviceptr dptr = 0;
 
-    if (!initialized || !real_cudaMalloc)
-        return CUDA_SUCCESS;
+    if (!initialized)
+        return (cudaError_t)CUDA_ERROR_OUT_OF_MEMORY;
+
+    /* Lazy resolve: libcudart may have been loaded by caller after our constructor.
+     * RTLD_NEXT skips our own symbol and finds the real one in the next library. */
+    if (!real_cudaMalloc)
+        real_cudaMalloc = (pfn_cudaMalloc)dlsym(RTLD_NEXT, "cudaMalloc");
+    if (!real_cudaMalloc)
+        return (cudaError_t)CUDA_ERROR_OUT_OF_MEMORY;
 
     if (gb_needs_overflow(size)) {
         ret = (cudaError_t)gb_overflow_alloc(&dptr, size);
@@ -522,8 +559,16 @@ cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream)
     cudaError_t ret;
     CUdeviceptr dptr = 0;
 
-    if (!initialized || !real_cudaMallocAsync)
-        return CUDA_SUCCESS;
+    if (!initialized)
+        return (cudaError_t)CUDA_ERROR_OUT_OF_MEMORY;
+
+    /* Lazy resolve: RTLD_NEXT skips our own symbol, finds real cudaMallocAsync in libcudart */
+    if (!real_cudaMallocAsync)
+        real_cudaMallocAsync = (pfn_cudaMallocAsync)dlsym(RTLD_NEXT, "cudaMallocAsync");
+
+    /* Fall back to sync cudaMalloc (stream ordering ignored — safe for model weights) */
+    if (!real_cudaMallocAsync)
+        return cudaMalloc(devPtr, size);
 
     if (gb_needs_overflow(size)) {
         ret = (cudaError_t)gb_overflow_alloc(&dptr, size);
@@ -550,7 +595,12 @@ cudaError_t cudaFree(void *devPtr)
     int managed = 0;
     CUdeviceptr dptr = (CUdeviceptr)(uintptr_t)devPtr;
 
-    if (!initialized || !real_cudaFree)
+    if (!initialized)
+        return CUDA_SUCCESS; /* free before init: no-op is safe */
+
+    if (!real_cudaFree)
+        real_cudaFree = (pfn_cudaFree)dlsym(RTLD_NEXT, "cudaFree");
+    if (!real_cudaFree)
         return CUDA_SUCCESS;
 
     if (ht_remove(dptr, &sz, &managed, &ext_mem)) {

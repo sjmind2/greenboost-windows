@@ -21,6 +21,7 @@
 #   sudo ./greenboost_setup.sh tune-libs        — install missing AI/compute libraries
 #   sudo ./greenboost_setup.sh tune-all         — run all tune-* commands
 #        ./greenboost_setup.sh status           — show pool info + system state
+#        ./greenboost_setup.sh diagnose         — full health check (run after reboot)
 #        ./greenboost_setup.sh build            — build only (no install)
 #        ./greenboost_setup.sh help             — show this help
 #
@@ -799,7 +800,12 @@ cmd_help() {
     echo "  tune-sysctl Consolidate sysctl files + apply compute-optimized knobs"
     echo "  tune-libs   Install missing AI/compute libraries (OpenBLAS, hwloc…)"
     echo "  tune-all    Run tune + tune-grub + tune-sysctl + tune-libs in sequence"
+    echo "  install-sys-configs  Install Ollama env, NVMe udev, CPU governor, hugepages, sysctl"
+    echo "  install-deps         Install all Ubuntu OS packages (build + CUDA + AI libs)"
+    echo "  setup-swap [GB]      Create/activate NVMe swap file (T3 tier, default 576 GB)"
+    echo "  full-install         Complete fresh-OS setup: deps+swap+build+install+configs+tune"
     echo "  status      Show module status and 3-tier pool info"
+    echo "  diagnose    Full health check — run this after reboot to verify everything works"
     echo "  help        Show this help"
     echo ""
     echo "ENVIRONMENT (for load):"
@@ -828,6 +834,606 @@ cmd_help() {
     echo ""
 }
 
+# ---- install-deps ------------------------------------------------------
+# Install all Ubuntu packages needed for GreenBoost v2.3 + ExLlamaV3
+
+cmd_install_deps() {
+    need_root install-deps
+    info "Installing Ubuntu dependencies for GreenBoost v2.3 + ExLlamaV3..."
+    info "Running apt-get update..."
+    apt-get update -qq
+
+    # Core build tools
+    apt-get install -y \
+        build-essential gcc make git curl wget \
+        linux-headers-"$(uname -r)" \
+        pkg-config sysfsutils
+
+    # io_uring — required for ExLlamaV3 stloader (replaces pread at 3 sites)
+    apt-get install -y liburing-dev
+
+    # Python (ExLlamaV3 + GreenBoost cache integration)
+    apt-get install -y python3 python3-pip python3-dev python3-venv
+
+    # CPU/GPU monitoring and tuning
+    apt-get install -y cpufrequtils linux-tools-generic nvtop || true
+    apt-get install -y linux-tools-"$(uname -r)" 2>/dev/null || true
+    apt-get install -y intel-microcode 2>/dev/null || true
+
+    # AI/compute libraries (OpenBLAS, hwloc, NUMA, OpenMP, OpenCL)
+    apt-get install -y \
+        libopenblas-dev libblas-dev liblapack-dev \
+        libhwloc-dev hwloc libnuma-dev libomp-dev \
+        ocl-icd-opencl-dev 2>/dev/null || true
+
+    # Ensure cpuid module loads at boot (for topology detection)
+    if ! grep -q cpuid /etc/modules-load.d/*.conf 2>/dev/null; then
+        echo cpuid > /etc/modules-load.d/ai-workstation.conf
+        info "cpuid module: added to modules-load.d"
+    fi
+
+    info "Ubuntu dependencies installed."
+    info "Note: NVIDIA driver 580+ and CUDA 13 must be installed separately."
+}
+
+# ---- setup-swap --------------------------------------------------------
+# Create NVMe swap file (T3 tier). Safe to re-run — idempotent.
+
+cmd_setup_swap() {
+    need_root setup-swap
+    local gb="${2:-576}"   # argument or default 576 GB
+    [[ "$1" == "setup-swap" ]] && gb="${2:-576}" || gb="${1:-576}"
+    local swap_file="/swap_nvme.img"
+    local swap_bytes=$(( gb * 1024 * 1024 * 1024 ))
+
+    info "Setting up NVMe swap file: $swap_file ($gb GB)..."
+
+    if [[ -f "$swap_file" ]]; then
+        local cur_size; cur_size=$(stat -c%s "$swap_file" 2>/dev/null || echo 0)
+        if [[ "$cur_size" -ge "$swap_bytes" ]]; then
+            info "Swap file already exists and is large enough ($gb GB): $swap_file"
+        else
+            local cur_gb=$(( cur_size / 1024 / 1024 / 1024 ))
+            warn "Swap file exists but is only ${cur_gb} GB (want $gb GB)"
+            warn "To expand: swapoff $swap_file && fallocate -l ${gb}G $swap_file && mkswap $swap_file && swapon -p 10 $swap_file"
+        fi
+    else
+        info "Creating ${gb} GB swap file (fallocate — fast on NVMe)..."
+        fallocate -l "${gb}G" "$swap_file" 2>/dev/null || \
+            dd if=/dev/zero of="$swap_file" bs=1G count="$gb" status=progress || \
+            die "Failed to create swap file $swap_file"
+        chmod 600 "$swap_file"
+        mkswap "$swap_file" || die "mkswap failed"
+        info "Swap file created: $swap_file"
+    fi
+
+    # Activate if not already active
+    if ! swapon --show | grep -q "$swap_file"; then
+        swapon -p 10 "$swap_file" && info "Swap activated (priority=10)" \
+            || warn "swapon failed — may need reboot"
+    else
+        info "Swap already active: $swap_file"
+    fi
+
+    # Add to fstab if missing
+    if ! grep -q "$swap_file" /etc/fstab; then
+        echo "$swap_file  none  swap  sw,pri=10  0 0" >> /etc/fstab
+        info "Added to /etc/fstab: $swap_file"
+    else
+        info "/etc/fstab: $swap_file already present"
+    fi
+
+    echo ""
+    swapon --show | sed 's/^/  /'
+}
+
+# ---- full-install ------------------------------------------------------
+# Complete fresh-OS install — run this after a clean Ubuntu install.
+# Covers: OS deps, NVMe swap, kernel module, CUDA shim, all system configs,
+# sysctl tuning, GRUB params, and optional ExLlamaV3 with GreenBoost patches.
+
+cmd_full_install() {
+    need_root full-install
+
+    info "╔══════════════════════════════════════════════════════════════╗"
+    info "║  GreenBoost v2.3 — Complete Fresh Install                   ║"
+    info "║  i9-14900KF | RTX 5070 OC | 64 GB DDR4 | Samsung 990 4 TB  ║"
+    info "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+
+    # 1/7 — OS dependencies
+    info "[1/7] Installing Ubuntu OS dependencies..."
+    cmd_install_deps
+    echo ""
+
+    # 2/7 — NVMe swap (T3 tier, 576 GB)
+    info "[2/7] Setting up NVMe swap file (T3 tier, 576 GB)..."
+    cmd_setup_swap 576
+    echo ""
+
+    # 3/7 — Build + install kernel module + CUDA shim
+    info "[3/7] Building and installing kernel module + CUDA shim..."
+    cmd_install
+    echo ""
+
+    # 4/7 — Load kernel module
+    info "[4/7] Loading kernel module with 3-tier params..."
+    cmd_load
+    echo ""
+
+    # 5/7 — System configs: Ollama, NVMe udev, CPU governor, hugepages, sysctl
+    info "[5/7] Installing system configuration files..."
+    cmd_install_sys_configs
+    echo ""
+
+    # 6/7 — Enhanced sysctl + GRUB params
+    info "[6/7] Applying sysctl tuning and GRUB boot params..."
+    cmd_tune_sysctl
+    echo ""
+    cmd_tune_grub
+    echo ""
+
+    # 7/7 — ExLlamaV3 with GreenBoost patches (optional)
+    info "[7/7] ExLlamaV3 + GreenBoost integration..."
+    local exllama_dir
+    exllama_dir="$(dirname "$MODULE_DIR")/greenboost_enhanced/exllamav3"
+    if [[ -d "$exllama_dir" ]]; then
+        info "Found ExLlamaV3 at $exllama_dir — installing with GreenBoost patches..."
+        # Ensure liburing-dev is present (io_uring stloader)
+        apt-get install -y liburing-dev 2>/dev/null || true
+        # Install ExLlamaV3 in editable mode (no build isolation needed for our patches)
+        STLOADER_USE_URING=1 pip install -e "$exllama_dir" --no-build-isolation \
+            && info "ExLlamaV3 installed (io_uring stloader + GreenBoost cache)" \
+            || warn "ExLlamaV3 install failed — run manually: pip install -e $exllama_dir --no-build-isolation"
+    else
+        warn "ExLlamaV3 not found at $exllama_dir"
+        warn "Set up greenboost_enhanced/exllamav3/ then run:"
+        warn "  STLOADER_USE_URING=1 pip install -e $exllama_dir --no-build-isolation"
+    fi
+    echo ""
+
+    info "╔══════════════════════════════════════════════════════════════╗"
+    info "║  Full install complete!                                      ║"
+    info "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+    warn "════════════════════════════════════════════════════════════════"
+    warn "REBOOT REQUIRED to activate GRUB params + hugepage pre-allocation"
+    warn "════════════════════════════════════════════════════════════════"
+    echo ""
+    info "After reboot, run the health check:"
+    info "  sudo ./greenboost_setup.sh diagnose"
+    echo ""
+    info "If models still appear stuck (CPU fallback), diagnose will show the issue."
+    info "For live Ollama logs: journalctl -u ollama -f"
+}
+
+# ---- diagnose ----------------------------------------------------------
+# Full health check + GLM-4.7-flash model benchmark.
+# Run after reboot: sudo ./greenboost_setup.sh diagnose
+# Structured log written to /var/log/greenboost/diagnose-latest.log
+
+cmd_diagnose() {
+    # ── Log setup ──────────────────────────────────────────────────────────
+    local LOG_DIR="/var/log/greenboost"
+    mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="/tmp"
+    local LOG_FILE="$LOG_DIR/diagnose-$(date +%Y%m%d_%H%M%S).log"
+    local LOG_LATEST="$LOG_DIR/diagnose-latest.log"
+    local issues=0
+    local recs=()
+
+    # Helpers — write to console AND log file
+    _L()    { printf "%s\n" "$*" >> "$LOG_FILE"; }
+    _chk()  { echo -e "  ${GRN}[OK]${NC}   $*"; printf "  [OK]   %s\n" "$*" >> "$LOG_FILE"; }
+    _fail() { echo -e "  ${RED}[FAIL]${NC} $*"; printf "  [FAIL] %s\n" "$*" >> "$LOG_FILE"; (( issues++ )); }
+    _warn() { echo -e "  ${YLW}[WARN]${NC} $*"; printf "  [WARN] %s\n" "$*" >> "$LOG_FILE"; }
+    _info() { echo -e "  ${BLU}[INFO]${NC} $*"; printf "  [INFO] %s\n" "$*" >> "$LOG_FILE"; }
+    _rec()  { recs+=("$*"); printf "  [REC]  %s\n" "$*" >> "$LOG_FILE"; }
+    _sect() {
+        echo -e "\n${BLU}━━━ $* ━━━${NC}"
+        printf "\n[%s]\n" "$*" >> "$LOG_FILE"
+    }
+
+    # Log header
+    {
+        echo "=== GreenBoost v2.3 Diagnose Log ==="
+        echo "timestamp=$(date '+%Y-%m-%d %H:%M:%S')"
+        echo "kernel=$(uname -r)"
+        echo "host=$(hostname)"
+        echo "models_target=glm-4.7-flash:q8_0  glm-4.7-flash:latest"
+        echo ""
+    } | tee "$LOG_FILE" > /dev/null
+
+    echo ""
+    echo -e "${BLU}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLU}║  GreenBoost v2.3 — Full Diagnostic + Model Benchmark        ║${NC}"
+    echo -e "${BLU}╚══════════════════════════════════════════════════════════════╝${NC}"
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 1. KERNEL MODULE
+    # ═══════════════════════════════════════════════════════════════════════
+    _sect "1/8  KERNEL MODULE"
+    if lsmod | grep -q "^greenboost "; then
+        _chk "greenboost.ko loaded"
+    else
+        _fail "greenboost.ko NOT loaded — run: sudo ./greenboost_setup.sh load"
+        _rec "Load module: sudo ./greenboost_setup.sh load"
+    fi
+    local pool_f="/sys/class/greenboost/greenboost/pool_info"
+    if [[ -r "$pool_f" ]]; then
+        _chk "sysfs readable"
+        while IFS= read -r ln; do _info "  $ln"; done < "$pool_f"
+    else
+        _warn "sysfs not available (module not loaded or init failed)"
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 2. NVIDIA + UVM
+    # ═══════════════════════════════════════════════════════════════════════
+    _sect "2/8  NVIDIA + UVM"
+    if lsmod | grep -q "^nvidia "; then
+        _chk "nvidia driver loaded"
+    else
+        _fail "nvidia NOT loaded — run: sudo modprobe nvidia"
+    fi
+    if lsmod | grep -q "^nvidia_uvm "; then
+        _chk "nvidia_uvm loaded (DDR4 UVM overflow available)"
+    else
+        _fail "nvidia_uvm NOT loaded — DDR4 overflow via UVM disabled"
+        _rec "sudo modprobe nvidia_uvm && echo nvidia_uvm | sudo tee /etc/modules-load.d/nvidia-uvm.conf"
+    fi
+    local vram_free_mb="" vram_total_mb=""
+    if command -v nvidia-smi &>/dev/null; then
+        local gpu_csv; gpu_csv=$(nvidia-smi --query-gpu=name,driver_version,memory.used,memory.free,memory.total \
+            --format=csv,noheader,nounits 2>/dev/null)
+        _chk "GPU: $gpu_csv  (MiB used/free/total)"
+        _L  "nvidia_smi=$gpu_csv"
+        vram_free_mb=$(echo "$gpu_csv" | awk -F', ' '{print $4}' | tr -d ' ')
+        vram_total_mb=$(echo "$gpu_csv" | awk -F', ' '{print $5}' | tr -d ' ')
+        if [[ -n "$vram_free_mb" && "$vram_free_mb" -lt 1024 ]]; then
+            _warn "Low free VRAM: ${vram_free_mb} MiB — another process may be holding GPU memory"
+            _rec "Check: sudo fuser /dev/nvidia0  |  sudo nvidia-smi"
+        fi
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 3. CUDA SHIM BINARY
+    # ═══════════════════════════════════════════════════════════════════════
+    _sect "3/8  CUDA SHIM BINARY"
+    local shim="$SHIM_DEST/$SHIM_LIB"
+    if [[ ! -f "$shim" ]]; then
+        _fail "Shim not installed: $shim — run: sudo ./greenboost_setup.sh install"
+    else
+        _chk "Shim installed: $shim ($(stat -c%s "$shim") bytes)"
+        # Detect the libcudart=NULL UB bug: GCC -O2 removes the search loop if
+        # libcudart is not initialised to NULL, leaving no cudart paths in binary
+        if strings "$shim" | grep -q "cuda_v13"; then
+            _chk "Cudart search paths present in binary (UB fix OK)"
+        else
+            _fail "Cudart search paths MISSING — shim built with uninitialized-libcudart UB bug"
+            _info "Every cudaMalloc returns OOM → models fall back to CPU (appears stuck)"
+            _info "Fix: cd $MODULE_DIR && make shim && sudo cp $SHIM_LIB $SHIM_DEST/ && sudo ldconfig && sudo systemctl restart ollama"
+            _rec "Rebuild shim: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
+        fi
+        # Live init test (no CUDA context — only checks symbol resolution)
+        local shim_out; shim_out=$(LD_PRELOAD="$shim" ls /dev/null 2>&1)
+        if echo "$shim_out" | grep -q "libcudart loaded:"; then
+            local cudart_path; cudart_path=$(echo "$shim_out" | grep "libcudart loaded:" | sed 's/.*libcudart loaded: //')
+            _chk "Shim init: libcudart found → $cudart_path"
+        elif echo "$shim_out" | grep -q "runtime API resolved lazily"; then
+            _fail "Shim init: libcudart NOT found — cudaMalloc will OOM on every call"
+            _rec "Rebuild shim: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
+        else
+            _warn "Shim init: status unknown (no CUDA driver in test process)"
+        fi
+        if echo "$shim_out" | grep -q "UVM overflow.*available"; then
+            _chk "Shim init: UVM overflow available"
+        elif echo "$shim_out" | grep -q "UVM overflow.*unavailable"; then
+            _warn "Shim init: UVM overflow unavailable — load nvidia_uvm"
+        fi
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 4. OLLAMA SERVICE + CONFIG
+    # ═══════════════════════════════════════════════════════════════════════
+    _sect "4/8  OLLAMA SERVICE"
+    if ! systemctl is-active --quiet ollama; then
+        _fail "Ollama NOT running — run: sudo systemctl start ollama"
+    else
+        _chk "Ollama service: active"
+    fi
+    local env_str; env_str=$(systemctl show ollama --property=Environment 2>/dev/null)
+    _L "ollama_env=$env_str"
+
+    echo "$env_str" | grep -q "LD_PRELOAD.*libgreenboost" \
+        && _chk "LD_PRELOAD=libgreenboost_cuda.so active" \
+        || { _fail "LD_PRELOAD not pointing to GreenBoost shim"; _rec "sudo ./greenboost_setup.sh install-sys-configs"; }
+
+    echo "$env_str" | grep -qE "OLLAMA_FLASH_ATTENTION=(1|true)" \
+        && _chk "OLLAMA_FLASH_ATTENTION=1 (halves KV cache VRAM)" \
+        || { _warn "OLLAMA_FLASH_ATTENTION not enabled"; _rec "Add Environment=OLLAMA_FLASH_ATTENTION=1 to Ollama service"; }
+
+    local kv_type; kv_type=$(echo "$env_str" | grep -oP 'OLLAMA_KV_CACHE_TYPE=\S+' | cut -d= -f2 | head -1)
+    [[ -n "$kv_type" ]] \
+        && _chk "OLLAMA_KV_CACHE_TYPE=$kv_type" \
+        || { _warn "OLLAMA_KV_CACHE_TYPE not set (defaults to f16 — large KV cache)"; _rec "Set OLLAMA_KV_CACHE_TYPE=q8_0 in Ollama service"; }
+
+    local ctx; ctx=$(echo "$env_str" | grep -oP 'OLLAMA_NUM_CTX=\d+' | cut -d= -f2 | head -1)
+    [[ -z "$ctx" ]] && ctx=$(echo "$env_str" | grep -oP 'OLLAMA_CONTEXT_LENGTH=\d+' | cut -d= -f2 | head -1)
+    _info "OLLAMA_NUM_CTX=${ctx:-default}"
+    _L "ctx=$ctx  kv_type=$kv_type"
+
+    local nthreads; nthreads=$(echo "$env_str" | grep -oP 'OLLAMA_NUM_THREADS=\d+' | cut -d= -f2 | head -1)
+    _info "OLLAMA_NUM_THREADS=${nthreads:-default}  (i9-14900KF: 8=P-cores-only, 16=P+E)"
+    if [[ -n "$nthreads" && "$nthreads" -gt 16 ]]; then
+        _rec "OLLAMA_NUM_THREADS=${nthreads} — try 8 (P-cores only, 6GHz) or 16 (P+E mix)"
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 5. SYSTEM TUNING
+    # ═══════════════════════════════════════════════════════════════════════
+    _sect "5/8  SYSTEM TUNING"
+
+    # CPU governor on P-cores
+    local perf_cores=0
+    for gov in /sys/devices/system/cpu/cpu{0..15}/cpufreq/scaling_governor; do
+        [[ -f "$gov" && "$(cat "$gov" 2>/dev/null)" == "performance" ]] && (( perf_cores++ ))
+    done
+    [[ $perf_cores -ge 16 ]] \
+        && _chk "CPU governor: performance on all 16 P-cores (0-15)" \
+        || { _warn "CPU governor: only $perf_cores/16 P-cores at performance"; _rec "sudo ./greenboost_setup.sh tune"; }
+
+    # THP
+    local thp; thp=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | grep -oP '\[\K[^\]]+')
+    [[ "$thp" == "always" ]] \
+        && _chk "THP: always (2MB hugepages enabled)" \
+        || { _warn "THP: ${thp:-unknown} (needs 'always' for GreenBoost T2 pool)"; _rec "echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled"; }
+
+    # Hugepages
+    local hp_total hp_free
+    hp_total=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || echo 0)
+    hp_free=$(cat  /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages  2>/dev/null || echo 0)
+    local hp_gb=$(( hp_total * 2 / 1024 ))
+    [[ $hp_total -ge 1000 ]] \
+        && _chk "Hugepages: ${hp_total} × 2MB = ${hp_gb} GB (${hp_free} free)" \
+        || { _warn "Hugepages: only $hp_total allocated (target 26112 = 51 GB for T2)"; _rec "Reboot after full-install to pre-allocate hugepages"; }
+
+    # NVMe scheduler
+    local nvme_sched; nvme_sched=$(cat /sys/block/nvme0n1/queue/scheduler 2>/dev/null | grep -oP '\[\K[^\]]+')
+    [[ "$nvme_sched" == "none" ]] \
+        && _chk "NVMe scheduler: none (optimal for Samsung 990)" \
+        || { _warn "NVMe scheduler: ${nvme_sched:-unknown} (should be none)"; _rec "sudo ./greenboost_setup.sh tune"; }
+
+    # NVMe swap T3
+    if swapon --show | grep -q "/swap_nvme.img"; then
+        local sw_used sw_size
+        sw_size=$(swapon --show --noheadings | grep "/swap_nvme.img" | awk '{print $3}')
+        sw_used=$(swapon --show --noheadings | grep "/swap_nvme.img" | awk '{print $4}')
+        _chk "T3 NVMe swap: ${sw_used}/${sw_size} used"
+    else
+        _warn "T3 NVMe swap /swap_nvme.img not active"
+        _rec "sudo ./greenboost_setup.sh setup-swap"
+    fi
+
+    # vm.swappiness
+    local swappiness; swappiness=$(sysctl -n vm.swappiness 2>/dev/null || echo 60)
+    [[ "$swappiness" -le 15 ]] \
+        && _chk "vm.swappiness=$swappiness (prefers RAM — good for LLM)" \
+        || { _warn "vm.swappiness=$swappiness (high — models may swap unnecessarily)"; _rec "sudo ./greenboost_setup.sh tune-sysctl"; }
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 6. MODEL BENCHMARK — shared helper
+    # ═══════════════════════════════════════════════════════════════════════
+    # Helper: run a timed inference test and report metrics
+    _bench_model() {
+        local model="$1"
+        _sect "6+7/8  MODEL BENCHMARK: $model"
+
+        # Check model is available in Ollama
+        local available; available=$(curl -s --max-time 5 http://127.0.0.1:11434/api/tags 2>/dev/null \
+            | python3 -c "
+import sys, json
+try:
+    names = [m['name'] for m in json.load(sys.stdin).get('models', [])]
+    print('yes' if '$model' in names else 'no')
+except:
+    print('error')
+" 2>/dev/null)
+        if [[ "$available" != "yes" ]]; then
+            _warn "Model $model not in Ollama — skipping (pull with: ollama pull $model)"
+            return
+        fi
+        _chk "Model available in Ollama"
+
+        # Snapshot VRAM before
+        local vram_before; vram_before=$(nvidia-smi --query-gpu=memory.used \
+            --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+
+        # Benchmark prompt — generates ~60-100 tokens, response is verifiable
+        local PROMPT="List all 8 planets of the solar system in order from the Sun, one per line, prefixed with their number."
+        local test_start; test_start=$(date --iso-8601=seconds)
+
+        _info "Sending inference request (stream=false, num_predict=150)..."
+        local response; response=$(curl -s --max-time 400 \
+            http://127.0.0.1:11434/api/generate \
+            -H "Content-Type: application/json" \
+            -d "{\"model\": \"$model\", \"prompt\": \"$PROMPT\", \"stream\": false, \"options\": {\"num_predict\": 150}}" \
+            2>/dev/null)
+
+        if [[ -z "$response" ]]; then
+            _fail "No response from Ollama (timeout or crash) — check: journalctl -u ollama -f"
+            return
+        fi
+
+        # Parse timing + response via python3
+        local parsed; parsed=$(python3 - <<'PYEOF'
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    ec  = d.get('eval_count', 0)
+    en  = d.get('eval_duration', 1) or 1
+    pc  = d.get('prompt_eval_count', 0)
+    pn  = d.get('prompt_eval_duration', 1) or 1
+    ln  = d.get('load_duration', 0)
+    tn  = d.get('total_duration', 1) or 1
+    tps = ec / (en / 1e9) if ec > 0 else 0.0
+    r   = (d.get('response') or '').strip()
+    planets = ['Mercury','Venus','Earth','Mars','Jupiter','Saturn','Uranus','Neptune']
+    found   = sum(1 for p in planets if p.lower() in r.lower())
+    snippet = r[:100].replace('\n', ' ')
+    print(f"load_s={ln/1e9:.2f}")
+    print(f"ttft_s={pn/1e9:.2f}")
+    print(f"tps={tps:.2f}")
+    print(f"eval_tokens={ec}")
+    print(f"total_s={tn/1e9:.2f}")
+    print(f"quality={found}/8")
+    print(f"snippet={snippet}")
+except Exception as e:
+    print(f"parse_error={e}")
+PYEOF
+        <<< "$response")
+
+        local load_s ttft_s tps eval_tokens total_s quality snippet
+        load_s=$(     echo "$parsed" | grep "^load_s="      | cut -d= -f2)
+        ttft_s=$(     echo "$parsed" | grep "^ttft_s="      | cut -d= -f2)
+        tps=$(        echo "$parsed" | grep "^tps="         | cut -d= -f2)
+        eval_tokens=$(echo "$parsed" | grep "^eval_tokens=" | cut -d= -f2)
+        total_s=$(    echo "$parsed" | grep "^total_s="     | cut -d= -f2)
+        quality=$(    echo "$parsed" | grep "^quality="     | cut -d= -f2)
+        snippet=$(    echo "$parsed" | grep "^snippet="     | cut -d= -f2-)
+
+        # GPU layer count from Ollama logs
+        local gpu_layers; gpu_layers=$(journalctl -u ollama --since "$test_start" --no-pager 2>/dev/null \
+            | grep "offloaded.*layers to GPU" | tail -1 | grep -oP '\d+/\d+' | head -1)
+        [[ -z "$gpu_layers" ]] && gpu_layers="?"
+
+        # VRAM delta
+        local vram_after; vram_after=$(nvidia-smi --query-gpu=memory.used \
+            --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+        local vram_delta=$(( ${vram_after:-0} - ${vram_before:-0} ))
+
+        # Display results
+        _chk  "Load time      : ${load_s}s"
+        _chk  "TTFT           : ${ttft_s}s"
+        _chk  "Throughput     : ${tps} tok/s  (${eval_tokens} tokens in ${total_s}s)"
+        _info "GPU layers     : $gpu_layers"
+        _info "VRAM delta     : +${vram_delta} MiB  (before=${vram_before} after=${vram_after})"
+        _info "Response check : $quality planets mentioned"
+        _info "Snippet        : $snippet"
+        _L    "benchmark model=$model load_s=$load_s ttft_s=$ttft_s tps=$tps eval_tokens=$eval_tokens gpu_layers=$gpu_layers vram_delta=$vram_delta quality=$quality"
+
+        # Evaluate GPU offload
+        if [[ "$gpu_layers" == "0/"* ]]; then
+            _fail "0 GPU layers — model running CPU-ONLY (GreenBoost DDR4 overflow not working)"
+            _rec  "Fix shim: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh && sudo systemctl restart ollama"
+        elif [[ "$gpu_layers" == "?" ]]; then
+            _warn "Could not read GPU layer count from logs — check: journalctl -u ollama | grep offloaded"
+        else
+            _chk  "GPU offload: $gpu_layers layers via GreenBoost DDR4 overflow"
+        fi
+
+        # Evaluate throughput
+        local tps_int; tps_int=$(echo "$tps" | python3 -c "import sys; v=float(sys.stdin.read().strip() or 0); print(int(v*10))" 2>/dev/null || echo 0)
+        if   [[ $tps_int -lt 15 ]]; then  # < 1.5 tok/s
+            _fail "Throughput ${tps} tok/s — very slow (likely CPU fallback or model hung)"
+            _rec  "Check Ollama logs: journalctl -u ollama --since '5 min ago' | grep -E 'offloaded|cudaMalloc'"
+        elif [[ $tps_int -lt 50 ]]; then  # < 5 tok/s
+            _warn "Throughput ${tps} tok/s — partial GPU (PCIe/DDR4 bandwidth limit expected for this model size)"
+        else
+            _chk  "Throughput ${tps} tok/s — good"
+        fi
+
+        # Verify response makes sense
+        if [[ "$quality" == "8/8" ]]; then
+            _chk "Response correct (all 8 planets)"
+        elif [[ "$quality" =~ ^[4-7]/8 ]]; then
+            _warn "Response partial ($quality planets) — model may have been cut off"
+        else
+            _warn "Response unexpected ($quality planets found) — snippet: $snippet"
+        fi
+    }
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 6. glm-4.7-flash:q8_0
+    # ═══════════════════════════════════════════════════════════════════════
+    _bench_model "glm-4.7-flash:q8_0"
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 7. glm-4.7-flash:latest
+    # ═══════════════════════════════════════════════════════════════════════
+    _bench_model "glm-4.7-flash:latest"
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 8. TUNING RECOMMENDATIONS
+    # ═══════════════════════════════════════════════════════════════════════
+    _sect "8/8  TUNING RECOMMENDATIONS"
+
+    # VRAM headroom vs model sizes
+    local headroom; headroom=$(echo "$env_str" | grep -oP 'GREENBOOST_VRAM_HEADROOM_MB=\d+' | cut -d= -f2)
+    headroom=${headroom:-1024}
+    _info "GREENBOOST_VRAM_HEADROOM_MB=$headroom — shim overflows to DDR4 when VRAM free < this"
+    if [[ -n "$vram_total_mb" && $headroom -gt $(( vram_total_mb / 6 )) ]]; then
+        _rec "GREENBOOST_VRAM_HEADROOM_MB=$headroom may be too conservative for ${vram_total_mb}MB GPU — try 512"
+    fi
+
+    # Context window
+    if [[ "$ctx" =~ ^[0-9]+$ ]]; then
+        if [[ $ctx -gt 32768 ]]; then
+            _warn "OLLAMA_NUM_CTX=$ctx is large — KV cache at q8_0 for glm-4.7-flash uses significant VRAM"
+            _rec  "Try OLLAMA_NUM_CTX=16384 for better VRAM/context balance (current: $ctx)"
+        elif [[ $ctx -lt 8192 ]]; then
+            _rec  "OLLAMA_NUM_CTX=$ctx is low for GLM-4.7 — try 16384 for better context quality"
+        else
+            _chk  "OLLAMA_NUM_CTX=$ctx (balanced)"
+        fi
+    fi
+
+    # GPU overhead
+    local overhead; overhead=$(echo "$env_str" | grep -oP 'OLLAMA_GPU_OVERHEAD=\d+' | cut -d= -f2)
+    if [[ -n "$overhead" ]]; then
+        local overhead_mb=$(( overhead / 1048576 ))
+        _info "OLLAMA_GPU_OVERHEAD=${overhead_mb} MB reserved in VRAM for compute graph"
+        [[ $overhead_mb -gt 512 ]] && _rec "OLLAMA_GPU_OVERHEAD=${overhead}(${overhead_mb}MB) — try 268435456 (256MB) to free VRAM for more layers"
+    fi
+
+    # CPU threads recommendation for this CPU
+    if [[ -z "$nthreads" ]]; then
+        _rec "Set OLLAMA_NUM_THREADS=8 to pin CPU inference to 6GHz P-cores only (default uses all 32 CPUs including 4.4GHz E-cores)"
+    fi
+
+    # Print all recommendations
+    if [[ ${#recs[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "${YLW}  Actionable recommendations:${NC}"
+        for i in "${!recs[@]}"; do
+            echo -e "  ${YLW}$(( i+1 )). ${recs[$i]}${NC}"
+        done
+        printf "\nActionable recommendations:\n" >> "$LOG_FILE"
+        for i in "${!recs[@]}"; do printf "  %d. %s\n" "$(( i+1 ))" "${recs[$i]}" >> "$LOG_FILE"; done
+    fi
+
+    # ── Final summary ────────────────────────────────────────────────────
+    {
+        echo ""
+        echo "=== End ==="
+        echo "issues=$issues"
+        echo "recommendations=${#recs[@]}"
+        echo "log=$LOG_FILE"
+    } >> "$LOG_FILE"
+    ln -sf "$LOG_FILE" "$LOG_LATEST"
+
+    echo ""
+    echo -e "${BLU}════════════════════════════════════════════════════════════════${NC}"
+    if [[ $issues -eq 0 ]]; then
+        echo -e "  ${GRN}All checks passed — GreenBoost is healthy ✓${NC}"
+    else
+        echo -e "  ${RED}$issues issue(s) found — see [FAIL] lines above${NC}"
+    fi
+    echo ""
+    echo -e "  Log: ${BLU}$LOG_LATEST${NC}"
+    echo -e "  Share with Claude Code: ${BLU}cat $LOG_LATEST${NC}"
+    echo ""
+}
+
 # ---- Entry point -------------------------------------------------------
 
 COMMAND="${1:-help}"
@@ -838,12 +1444,16 @@ case "$COMMAND" in
     load)               cmd_load               ;;
     unload)             cmd_unload             ;;
     install-sys-configs) cmd_install_sys_configs ;;
+    install-deps)        cmd_install_deps       ;;
+    setup-swap)          cmd_setup_swap "$@"    ;;
+    full-install)        cmd_full_install       ;;
     tune)               cmd_tune               ;;
     tune-grub)          cmd_tune_grub          ;;
     tune-sysctl)        cmd_tune_sysctl        ;;
     tune-libs)          cmd_tune_libs          ;;
     tune-all)           cmd_tune_all           ;;
     status)             cmd_status             ;;
+    diagnose)           cmd_diagnose           ;;
     help|--help|-h)     cmd_help               ;;
     *) die "Unknown command: '$COMMAND'  — use: $0 help" ;;
 esac

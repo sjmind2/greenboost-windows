@@ -18,6 +18,7 @@ __section(".gnu.linkonce.this_module") = {
 
 static const struct modversion_info ____versions[]
 __used __section("__versions") = {
+	{ 0xf1de9e85, "vunmap" },
 	{ 0xf46d5bf3, "mutex_init_generic" },
 	{ 0x9f222e1e, "alloc_chrdev_region" },
 	{ 0xaa9455c8, "cdev_init" },
@@ -35,8 +36,11 @@ __used __section("__versions") = {
 	{ 0x69a29051, "class_destroy" },
 	{ 0xd1ed87cb, "cdev_del" },
 	{ 0x0bc5fb0d, "unregister_chrdev_region" },
+	{ 0xe0418251, "eventfd_ctx_put" },
 	{ 0x37ef79a4, "kthread_stop" },
 	{ 0x255dfd5a, "idr_destroy" },
+	{ 0xde338d9a, "_raw_spin_lock" },
+	{ 0xde338d9a, "_raw_spin_unlock" },
 	{ 0xf46d5bf3, "mutex_lock" },
 	{ 0x07d50c57, "idr_remove" },
 	{ 0xf46d5bf3, "mutex_unlock" },
@@ -49,15 +53,18 @@ __used __section("__versions") = {
 	{ 0x70670de1, "vmap" },
 	{ 0x5e865cb8, "pgprot_writecombine" },
 	{ 0xb6d1d445, "vm_insert_page" },
-	{ 0x092a35a2, "_copy_to_user" },
 	{ 0x092a35a2, "_copy_from_user" },
+	{ 0x5244a5dc, "idr_find" },
+	{ 0x092a35a2, "_copy_to_user" },
+	{ 0x3c0300ea, "eventfd_ctx_fdget" },
+	{ 0x058c185a, "jiffies" },
+	{ 0x56fa7025, "dma_buf_export" },
+	{ 0xb82edfb3, "idr_alloc" },
+	{ 0xacba1b52, "dma_buf_fd" },
 	{ 0xbd03ed67, "random_kmalloc_seed" },
 	{ 0x6ba71a8b, "kmalloc_caches" },
 	{ 0x7a0b7d1b, "__kmalloc_cache_noprof" },
 	{ 0x6602c262, "alloc_pages_noprof" },
-	{ 0x56fa7025, "dma_buf_export" },
-	{ 0xb82edfb3, "idr_alloc" },
-	{ 0xacba1b52, "dma_buf_fd" },
 	{ 0x05ce7807, "dma_buf_put" },
 	{ 0xb09bc67d, "sg_alloc_table" },
 	{ 0x804af820, "sg_alloc_table_from_pages_segment" },
@@ -71,18 +78,19 @@ __used __section("__versions") = {
 	{ 0x5723059f, "msleep_interruptible" },
 	{ 0xc7ffe1aa, "si_meminfo" },
 	{ 0xf654f750, "nr_swap_pages" },
+	{ 0x18ded256, "eventfd_signal_mask" },
 	{ 0xd272d446, "__stack_chk_fail" },
 	{ 0xdd6830c7, "sysfs_emit" },
 	{ 0x2182515b, "__num_online_cpus" },
 	{ 0x16402e05, "dma_unmap_sg_attrs" },
 	{ 0xd648ae19, "sg_free_table" },
 	{ 0xcb8b6ec6, "kfree" },
-	{ 0xf1de9e85, "vunmap" },
 	{ 0x5f8848a0, "module_layout" },
 };
 
 static const u32 ____version_ext_crcs[]
 __used __section("__version_ext_crcs") = {
+	0xf1de9e85,
 	0xf46d5bf3,
 	0x9f222e1e,
 	0xaa9455c8,
@@ -100,8 +108,11 @@ __used __section("__version_ext_crcs") = {
 	0x69a29051,
 	0xd1ed87cb,
 	0x0bc5fb0d,
+	0xe0418251,
 	0x37ef79a4,
 	0x255dfd5a,
+	0xde338d9a,
+	0xde338d9a,
 	0xf46d5bf3,
 	0x07d50c57,
 	0xf46d5bf3,
@@ -115,14 +126,17 @@ __used __section("__version_ext_crcs") = {
 	0x5e865cb8,
 	0xb6d1d445,
 	0x092a35a2,
+	0x5244a5dc,
 	0x092a35a2,
+	0x3c0300ea,
+	0x058c185a,
+	0x56fa7025,
+	0xb82edfb3,
+	0xacba1b52,
 	0xbd03ed67,
 	0x6ba71a8b,
 	0x7a0b7d1b,
 	0x6602c262,
-	0x56fa7025,
-	0xb82edfb3,
-	0xacba1b52,
 	0x05ce7807,
 	0xb09bc67d,
 	0x804af820,
@@ -136,17 +150,18 @@ __used __section("__version_ext_crcs") = {
 	0x5723059f,
 	0xc7ffe1aa,
 	0xf654f750,
+	0x18ded256,
 	0xd272d446,
 	0xdd6830c7,
 	0x2182515b,
 	0x16402e05,
 	0xd648ae19,
 	0xcb8b6ec6,
-	0xf1de9e85,
 	0x5f8848a0,
 };
 static const char ____version_ext_names[]
 __used __section("__version_ext_names") =
+	"vunmap\0"
 	"mutex_init_generic\0"
 	"alloc_chrdev_region\0"
 	"cdev_init\0"
@@ -164,8 +179,11 @@ __used __section("__version_ext_names") =
 	"class_destroy\0"
 	"cdev_del\0"
 	"unregister_chrdev_region\0"
+	"eventfd_ctx_put\0"
 	"kthread_stop\0"
 	"idr_destroy\0"
+	"_raw_spin_lock\0"
+	"_raw_spin_unlock\0"
 	"mutex_lock\0"
 	"idr_remove\0"
 	"mutex_unlock\0"
@@ -178,15 +196,18 @@ __used __section("__version_ext_names") =
 	"vmap\0"
 	"pgprot_writecombine\0"
 	"vm_insert_page\0"
-	"_copy_to_user\0"
 	"_copy_from_user\0"
+	"idr_find\0"
+	"_copy_to_user\0"
+	"eventfd_ctx_fdget\0"
+	"jiffies\0"
+	"dma_buf_export\0"
+	"idr_alloc\0"
+	"dma_buf_fd\0"
 	"random_kmalloc_seed\0"
 	"kmalloc_caches\0"
 	"__kmalloc_cache_noprof\0"
 	"alloc_pages_noprof\0"
-	"dma_buf_export\0"
-	"idr_alloc\0"
-	"dma_buf_fd\0"
 	"dma_buf_put\0"
 	"sg_alloc_table\0"
 	"sg_alloc_table_from_pages_segment\0"
@@ -200,17 +221,17 @@ __used __section("__version_ext_names") =
 	"msleep_interruptible\0"
 	"si_meminfo\0"
 	"nr_swap_pages\0"
+	"eventfd_signal_mask\0"
 	"__stack_chk_fail\0"
 	"sysfs_emit\0"
 	"__num_online_cpus\0"
 	"dma_unmap_sg_attrs\0"
 	"sg_free_table\0"
 	"kfree\0"
-	"vunmap\0"
 	"module_layout\0"
 ;
 
 MODULE_INFO(depends, "");
 
 
-MODULE_INFO(srcversion, "C14C802A5EF18AEDF4F3941");
+MODULE_INFO(srcversion, "ED4AB393B0649628F99C9ED");
