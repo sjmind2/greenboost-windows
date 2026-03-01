@@ -43,6 +43,7 @@ typedef unsigned long long CUdeviceptr;
 typedef int                CUresult;
 typedef int                cudaError_t;
 typedef unsigned int       CUmemAttach_flags;
+typedef int                CUdevice;
 typedef struct CUstream_st *CUstream;
 typedef CUstream            cudaStream_t;
 
@@ -175,6 +176,18 @@ typedef cudaError_t (*pfn_cudaImportExternalMemory)(cudaExternalMemory_t *,
 typedef cudaError_t (*pfn_cudaExternalMemoryGetMappedBuffer)(void **, cudaExternalMemory_t,
                                                              const struct cudaExternalMemoryBufferDesc *);
 typedef cudaError_t (*pfn_cudaDestroyExternalMemory)(cudaExternalMemory_t);
+typedef cudaError_t (*pfn_cudaMemGetInfo)(size_t *, size_t *);
+typedef CUresult    (*pfn_cuDeviceTotalMem_v2)(size_t *, CUdevice);
+
+/* NVML types (minimal — avoids libnvidia-ml dependency) */
+typedef void *nvmlDevice_t;
+typedef unsigned int nvmlReturn_t;
+#define NVML_SUCCESS 0
+typedef struct { unsigned long long total; unsigned long long free; unsigned long long used; } nvmlMemory_t;
+typedef struct { unsigned int version; unsigned long long total; unsigned long long reserved;
+                 unsigned long long free; unsigned long long used; } nvmlMemory_v2_t;
+typedef nvmlReturn_t (*pfn_nvmlDeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t *);
+typedef nvmlReturn_t (*pfn_nvmlDeviceGetMemoryInfo_v2)(nvmlDevice_t, nvmlMemory_v2_t *);
 
 /* ------------------------------------------------------------------ */
 /*  Global state                                                        */
@@ -192,11 +205,19 @@ static pfn_cudaMallocAsync                 real_cudaMallocAsync;
 static pfn_cudaImportExternalMemory        real_cudaImportExternalMemory;
 static pfn_cudaExternalMemoryGetMappedBuffer real_cudaExternalMemoryGetMappedBuffer;
 static pfn_cudaDestroyExternalMemory       real_cudaDestroyExternalMemory;
+static pfn_cudaMemGetInfo                  real_cudaMemGetInfo;
+static pfn_cuDeviceTotalMem_v2             real_cuDeviceTotalMem_v2;
+static pfn_nvmlDeviceGetMemoryInfo         real_nvmlDeviceGetMemoryInfo;
+static pfn_nvmlDeviceGetMemoryInfo_v2      real_nvmlDeviceGetMemoryInfo_v2;
 
-static size_t vram_headroom_bytes = 1024ULL * 1024 * 1024; /* 1 GB */
-static int    gb_debug            = 0;
-static int    gb_use_dmabuf       = 1;
-static int    initialized         = 0;
+static size_t vram_headroom_bytes   = 1024ULL * 1024 * 1024; /* 1 GB */
+static size_t gb_virtual_vram_bytes = 51ULL * 1024 * 1024 * 1024; /* DDR4 pool — reported to CUDA */
+static int    gb_debug              = 0;
+/* DMA-BUF disabled by default: cudaExternalMemoryHandleTypeOpaqueFd is for
+ * CUDA IPC memory, not arbitrary kernel DMA-BUF — import fails and corrupts
+ * the CUDA context.  Set GREENBOOST_USE_DMA_BUF=1 to re-enable for testing. */
+static int    gb_use_dmabuf         = 0;
+static int    initialized           = 0;
 
 /* /dev/greenboost fd — opened lazily on first DMA-BUF allocation */
 static int        gb_dev_fd       = -1;
@@ -247,12 +268,16 @@ static CUresult gb_import_as_cuda_ptr(CUdeviceptr *dptr, size_t bytesize,
     req.flags = GB_ALLOC_WEIGHTS;
 
     if (ioctl(fd, GB_IOCTL_ALLOC, &req) < 0) {
-        gb_log("GB_IOCTL_ALLOC failed for %zu MB: %m", bytesize >> 20);
+        fprintf(stderr, "[GreenBoost] GB_IOCTL_ALLOC failed for %zu MB: %m\n",
+                bytesize >> 20);
         return CUDA_ERROR_OUT_OF_MEMORY;
     }
 
     /* Import DMA-BUF fd as CUDA external memory.
-     * cudaImportExternalMemory with OpaqueFd takes ownership of the fd. */
+     * NOTE: cudaExternalMemoryHandleTypeOpaqueFd on Linux is designed for
+     * CUDA IPC handles, not arbitrary kernel DMA-BUF.  This path is kept
+     * for future compatibility but is disabled by default (gb_use_dmabuf=0).
+     * The CUDA driver takes ownership of the fd (even on failure). */
     memset(&hdesc, 0, sizeof(hdesc));
     hdesc.type        = cudaExternalMemoryHandleTypeOpaqueFd;
     hdesc.handle.fd   = req.fd;
@@ -260,8 +285,11 @@ static CUresult gb_import_as_cuda_ptr(CUdeviceptr *dptr, size_t bytesize,
 
     ret = real_cudaImportExternalMemory(&ext_mem, &hdesc);
     if (ret != CUDA_SUCCESS) {
-        gb_log("cudaImportExternalMemory failed ret=%d for %zu MB", ret, bytesize >> 20);
-        close(req.fd); /* fd not consumed on failure */
+        fprintf(stderr,
+                "[GreenBoost] cudaImportExternalMemory FAILED ret=%d for %zu MB"
+                " (OpaqueFd is for CUDA IPC, not generic DMA-BUF)\n",
+                ret, bytesize >> 20);
+        /* NVIDIA takes ownership of fd even on failure — do NOT close() here */
         return CUDA_ERROR_OUT_OF_MEMORY;
     }
 
@@ -270,7 +298,9 @@ static CUresult gb_import_as_cuda_ptr(CUdeviceptr *dptr, size_t bytesize,
 
     ret = real_cudaExternalMemoryGetMappedBuffer(&mapped_ptr, ext_mem, &bdesc);
     if (ret != CUDA_SUCCESS) {
-        gb_log("cudaExternalMemoryGetMappedBuffer failed ret=%d", ret);
+        fprintf(stderr,
+                "[GreenBoost] cudaExternalMemoryGetMappedBuffer FAILED ret=%d\n",
+                ret);
         real_cudaDestroyExternalMemory(ext_mem);
         return CUDA_ERROR_OUT_OF_MEMORY;
     }
@@ -298,6 +328,9 @@ static void gb_shim_init(void)
 
     env = getenv("GREENBOOST_VRAM_HEADROOM_MB");
     if (env) vram_headroom_bytes = (size_t)atoll(env) * 1024ULL * 1024ULL;
+
+    env = getenv("GREENBOOST_VIRTUAL_VRAM_MB");
+    if (env) gb_virtual_vram_bytes = (size_t)atoll(env) * 1024ULL * 1024ULL;
 
     env = getenv("GREENBOOST_DEBUG");
     if (env && env[0] == '1') gb_debug = 1;
@@ -341,6 +374,21 @@ static void gb_shim_init(void)
     real_cuMemGetInfo      = (pfn_cuMemGetInfo)       dlsym(libcuda, "cuMemGetInfo_v2");
     if (!real_cuMemGetInfo)
         real_cuMemGetInfo  = (pfn_cuMemGetInfo)       dlsym(libcuda, "cuMemGetInfo");
+    real_cuDeviceTotalMem_v2 = (pfn_cuDeviceTotalMem_v2) dlsym(libcuda, "cuDeviceTotalMem_v2");
+    if (!real_cuDeviceTotalMem_v2)
+        real_cuDeviceTotalMem_v2 = (pfn_cuDeviceTotalMem_v2) dlsym(libcuda, "cuDeviceTotalMem");
+
+    /* NVML — loaded separately; Ollama uses this for GPU memory discovery */
+    {
+        void *libnvml = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_GLOBAL);
+        if (!libnvml) libnvml = dlopen("libnvidia-ml.so", RTLD_NOW | RTLD_GLOBAL);
+        if (libnvml) {
+            real_nvmlDeviceGetMemoryInfo    = (pfn_nvmlDeviceGetMemoryInfo)
+                dlsym(libnvml, "nvmlDeviceGetMemoryInfo");
+            real_nvmlDeviceGetMemoryInfo_v2 = (pfn_nvmlDeviceGetMemoryInfo_v2)
+                dlsym(libnvml, "nvmlDeviceGetMemoryInfo_v2");
+        }
+    }
 
     /* Runtime API (cuda*) — live in libcudart, not libcuda */
     if (libcudart) {
@@ -355,12 +403,15 @@ static void gb_shim_init(void)
             dlsym(libcudart, "cudaExternalMemoryGetMappedBuffer");
         real_cudaDestroyExternalMemory       = (pfn_cudaDestroyExternalMemory)
             dlsym(libcudart, "cudaDestroyExternalMemory");
+        real_cudaMemGetInfo                  = (pfn_cudaMemGetInfo)
+            dlsym(libcudart, "cudaMemGetInfo");
     }
     /* Fallback: some CUDA versions export runtime wrappers from libcuda.so.1 */
     if (!real_cudaMalloc)        real_cudaMalloc        = (pfn_cudaMalloc)        dlsym(libcuda, "cudaMalloc");
     if (!real_cudaFree)          real_cudaFree          = (pfn_cudaFree)           dlsym(libcuda, "cudaFree");
     if (!real_cudaMallocManaged) real_cudaMallocManaged = (pfn_cudaMallocManaged)  dlsym(libcuda, "cudaMallocManaged");
     if (!real_cudaMallocAsync)   real_cudaMallocAsync   = (pfn_cudaMallocAsync)    dlsym(libcuda, "cudaMallocAsync");
+    if (!real_cudaMemGetInfo)    real_cudaMemGetInfo    = (pfn_cudaMemGetInfo)     dlsym(libcuda, "cudaMemGetInfo");
 
     if (!real_cuMemAlloc_v2 || !real_cuMemFree_v2) {
         fprintf(stderr, "[GreenBoost] WARNING: failed to resolve core CUDA symbols\n");
@@ -369,16 +420,27 @@ static void gb_shim_init(void)
 
     initialized = 1;
 
-    fprintf(stderr, "[GreenBoost] v2.0 loaded — vram_headroom=%zuMB use_dmabuf=%d debug=%d\n",
-            vram_headroom_bytes >> 20, gb_use_dmabuf, gb_debug);
+    fprintf(stderr, "[GreenBoost] v2.3 loaded — vram_headroom=%zuMB virtual_vram=%zuMB use_dmabuf=%d debug=%d\n",
+            vram_headroom_bytes >> 20, gb_virtual_vram_bytes >> 20, gb_use_dmabuf, gb_debug);
+    fprintf(stderr, "[GreenBoost] UVM overflow      : %s (primary DDR4 path)\n",
+            real_cuMemAllocManaged ? "available" : "UNAVAILABLE — load nvidia_uvm.ko");
     fprintf(stderr, "[GreenBoost] DMA-BUF import   : %s\n",
-            (real_cudaImportExternalMemory && gb_use_dmabuf) ? "available" : "disabled");
-    fprintf(stderr, "[GreenBoost] UVM overflow      : %s\n",
-            real_cuMemAllocManaged ? "available" : "unavailable (load nvidia_uvm)");
+            (real_cudaImportExternalMemory && gb_use_dmabuf) ? "enabled"
+            : gb_use_dmabuf ? "wanted but cudaImportExternalMemory missing"
+            : "disabled (set GREENBOOST_USE_DMA_BUF=1 to enable)");
     fprintf(stderr, "[GreenBoost] Async alloc hooks : cuMemAllocAsync=%s cudaMallocAsync=%s\n",
             real_cuMemAllocAsync ? "hooked" : "missing",
             real_cudaMallocAsync ? "hooked" : "missing");
-    fprintf(stderr, "[GreenBoost] Combined VRAM     : 12 GB physical + 51 GB DDR4 via GreenBoost\n");
+    fprintf(stderr, "[GreenBoost] cuMemGetInfo hook : %s (reports +%zu MB virtual VRAM to CUDA)\n",
+            real_cuMemGetInfo ? "active" : "missing",
+            gb_virtual_vram_bytes >> 20);
+    fprintf(stderr, "[GreenBoost] cuDeviceTotalMem  : %s\n",
+            real_cuDeviceTotalMem_v2 ? "hooked" : "missing");
+    fprintf(stderr, "[GreenBoost] nvmlMemInfo hook  : %s\n",
+            real_nvmlDeviceGetMemoryInfo ? "hooked" : "missing (NVML not found)");
+    fprintf(stderr, "[GreenBoost] dlsym hook        : active (intercepts dlopen+dlsym GPU API calls)\n");
+    fprintf(stderr, "[GreenBoost] Combined VRAM     : 12 GB physical + %zu GB DDR4 via GreenBoost\n",
+            gb_virtual_vram_bytes >> 30);
 }
 
 /* ------------------------------------------------------------------ */
@@ -418,28 +480,48 @@ static int gb_needs_overflow(size_t bytesize)
     return 0;
 }
 
-/* Try DMA-BUF path first, fall back to UVM */
+/* Try UVM first (safe, no context corruption), DMA-BUF second (disabled by default) */
 static CUresult gb_overflow_alloc(CUdeviceptr *dptr, size_t bytesize)
 {
     cudaExternalMemory_t ext_mem = NULL;
     CUresult ret;
 
+    /* ---- Path 1: UVM (cuMemAllocManaged) -------------------------------- */
+    /* Primary overflow path.  Backed by system RAM; GPU accesses via page   */
+    /* migration.  Does not touch cudaImportExternalMemory, so CUDA context  */
+    /* stays clean.                                                            */
+    if (real_cuMemAllocManaged) {
+        ret = real_cuMemAllocManaged(dptr, bytesize, CU_MEM_ATTACH_GLOBAL);
+        if (ret == CUDA_SUCCESS) {
+            ht_insert(*dptr, bytesize, 1 /* UVM */, -1, NULL);
+            gb_log("UVM alloc: %zu MB at 0x%llx", bytesize >> 20,
+                   (unsigned long long)*dptr);
+            return CUDA_SUCCESS;
+        }
+        /* Always print UVM failure — visible in journalctl without debug mode */
+        fprintf(stderr,
+                "[GreenBoost] UVM alloc FAILED ret=%d for %zu MB"
+                " — check nvidia_uvm is loaded and CUDA context is valid\n",
+                ret, bytesize >> 20);
+    } else {
+        fprintf(stderr, "[GreenBoost] UVM unavailable (real_cuMemAllocManaged=NULL)"
+                " for %zu MB\n", bytesize >> 20);
+    }
+
+    /* ---- Path 2: DMA-BUF (disabled by default) -------------------------- */
+    /* cudaExternalMemoryHandleTypeOpaqueFd is for CUDA IPC, not arbitrary   */
+    /* kernel DMA-BUF.  Enable with GREENBOOST_USE_DMA_BUF=1 for testing.   */
     if (gb_use_dmabuf && real_cudaImportExternalMemory) {
         ret = gb_import_as_cuda_ptr(dptr, bytesize, &ext_mem);
         if (ret == CUDA_SUCCESS) {
-            ht_insert(*dptr, bytesize, 0 /* not UVM */, -1, ext_mem);
+            ht_insert(*dptr, bytesize, 0 /* DMA-BUF */, -1, ext_mem);
             return CUDA_SUCCESS;
         }
-        gb_log("DMA-BUF import failed (ret=%d), falling back to UVM", ret);
+        fprintf(stderr, "[GreenBoost] DMA-BUF import FAILED ret=%d for %zu MB\n",
+                ret, bytesize >> 20);
     }
 
-    if (!real_cuMemAllocManaged)
-        return CUDA_ERROR_OUT_OF_MEMORY;
-
-    ret = real_cuMemAllocManaged(dptr, bytesize, CU_MEM_ATTACH_GLOBAL);
-    if (ret == CUDA_SUCCESS)
-        ht_insert(*dptr, bytesize, 1 /* UVM */, -1, NULL);
-    return ret;
+    return CUDA_ERROR_OUT_OF_MEMORY;
 }
 
 /* ------------------------------------------------------------------ */
@@ -611,4 +693,264 @@ cudaError_t cudaFree(void *devPtr)
     }
 
     return real_cudaFree(devPtr);
+}
+
+/* ------------------------------------------------------------------ */
+/*  cuMemGetInfo_v2 / cuMemGetInfo / cudaMemGetInfo overrides          */
+/*                                                                      */
+/*  Report virtual VRAM = real VRAM + DDR4 pool so the CUDA runtime    */
+/*  and Ollama scheduler offload ALL model layers as GPU tensors.       */
+/*  Each resulting cudaMalloc that overflows real VRAM is then          */
+/*  redirected to DDR4 via DMA-BUF (gb_needs_overflow uses real VRAM). */
+/* ------------------------------------------------------------------ */
+
+CUresult cuMemGetInfo_v2(size_t *free_out, size_t *total_out)
+{
+    size_t real_free = 0, real_total = 0;
+    CUresult ret;
+
+    if (!initialized || !real_cuMemGetInfo)
+        return CUDA_ERROR_NOT_SUPPORTED;
+
+    ret = real_cuMemGetInfo(&real_free, &real_total);
+    if (ret != CUDA_SUCCESS)
+        return ret;
+
+    if (free_out)  *free_out  = real_free  + gb_virtual_vram_bytes;
+    if (total_out) *total_out = real_total + gb_virtual_vram_bytes;
+
+    gb_log("cuMemGetInfo_v2: real_free=%zuMB → virtual_free=%zuMB",
+           real_free >> 20, (real_free + gb_virtual_vram_bytes) >> 20);
+    return CUDA_SUCCESS;
+}
+
+CUresult cuMemGetInfo(size_t *free_out, size_t *total_out)
+{
+    return cuMemGetInfo_v2(free_out, total_out);
+}
+
+cudaError_t cudaMemGetInfo(size_t *free_out, size_t *total_out)
+{
+    size_t real_free = 0, real_total = 0;
+    CUresult ret;
+
+    if (!initialized || !real_cuMemGetInfo)
+        return (cudaError_t)CUDA_ERROR_NOT_SUPPORTED;
+
+    /* Call real driver function directly — avoids double-inflation if libcudart
+     * internally calls cuMemGetInfo_v2 (which we also override). */
+    ret = real_cuMemGetInfo(&real_free, &real_total);
+    if (ret != CUDA_SUCCESS)
+        return (cudaError_t)ret;
+
+    if (free_out)  *free_out  = real_free  + gb_virtual_vram_bytes;
+    if (total_out) *total_out = real_total + gb_virtual_vram_bytes;
+
+    gb_log("cudaMemGetInfo: real_free=%zuMB → virtual_free=%zuMB",
+           real_free >> 20, (real_free + gb_virtual_vram_bytes) >> 20);
+    return CUDA_SUCCESS;
+}
+
+/* ------------------------------------------------------------------ */
+/*  cuDeviceTotalMem overrides                                          */
+/*                                                                      */
+/*  Ollama's scheduler calls cuDeviceTotalMem at startup to determine   */
+/*  how many model layers fit in VRAM.  Inflate by DDR4 pool size so   */
+/*  all layers are scheduled as GPU tensors; the allocations that       */
+/*  overflow real VRAM are caught by cudaMalloc/cuMemAlloc above.       */
+/* ------------------------------------------------------------------ */
+
+CUresult cuDeviceTotalMem_v2(size_t *bytes, CUdevice dev)
+{
+    CUresult ret;
+
+    if (!initialized || !real_cuDeviceTotalMem_v2)
+        return CUDA_ERROR_NOT_SUPPORTED;
+
+    ret = real_cuDeviceTotalMem_v2(bytes, dev);
+    if (ret == CUDA_SUCCESS && bytes) {
+        gb_log("cuDeviceTotalMem_v2: real=%zuMB → virtual=%zuMB",
+               *bytes >> 20, (*bytes + gb_virtual_vram_bytes) >> 20);
+        *bytes += gb_virtual_vram_bytes;
+    }
+    return ret;
+}
+
+CUresult cuDeviceTotalMem(size_t *bytes, CUdevice dev)
+{
+    return cuDeviceTotalMem_v2(bytes, dev);
+}
+
+/* ------------------------------------------------------------------ */
+/*  NVML overrides — nvmlDeviceGetMemoryInfo[_v2]                      */
+/*                                                                      */
+/*  Ollama's discover/nvidia.go uses NVML for initial GPU sizing.       */
+/*  Inflate total + free so the layer scheduler sees virtual VRAM.      */
+/* ------------------------------------------------------------------ */
+
+nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory)
+{
+    nvmlReturn_t ret;
+
+    if (!real_nvmlDeviceGetMemoryInfo)
+        return 999; /* NVML_ERROR_FUNCTION_NOT_FOUND */
+
+    ret = real_nvmlDeviceGetMemoryInfo(device, memory);
+    if (ret == NVML_SUCCESS && memory) {
+        gb_log("nvmlDeviceGetMemoryInfo: real_total=%lluMB → virtual_total=%lluMB",
+               memory->total >> 20,
+               (memory->total + gb_virtual_vram_bytes) >> 20);
+        memory->total += gb_virtual_vram_bytes;
+        memory->free  += gb_virtual_vram_bytes;
+    }
+    return ret;
+}
+
+nvmlReturn_t nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMemory_v2_t *memory)
+{
+    nvmlReturn_t ret;
+
+    if (!real_nvmlDeviceGetMemoryInfo_v2)
+        return 999;
+
+    ret = real_nvmlDeviceGetMemoryInfo_v2(device, memory);
+    if (ret == NVML_SUCCESS && memory) {
+        gb_log("nvmlDeviceGetMemoryInfo_v2: real_total=%lluMB → virtual_total=%lluMB",
+               memory->total >> 20,
+               (memory->total + gb_virtual_vram_bytes) >> 20);
+        memory->total += gb_virtual_vram_bytes;
+        memory->free  += gb_virtual_vram_bytes;
+    }
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/*  dlsym hook — intercepts dlopen-based GPU API lookups               */
+/*                                                                      */
+/*  Ollama accesses NVML and CUDA driver via dlopen+dlsym, which       */
+/*  bypasses standard LD_PRELOAD interception.  We override dlsym to   */
+/*  return our hooked versions for memory-reporting symbols so that     */
+/*  Ollama's GPU discovery sees the virtual (inflated) VRAM size.       */
+/*                                                                      */
+/*  Bootstrap: __libc_dlsym is used to get the REAL dlsym without      */
+/*  triggering a recursive call through our own override.               */
+/* ------------------------------------------------------------------ */
+
+typedef void *(*pfn_dlsym_t)(void *, const char *);
+typedef void *(*pfn_dlopen_t)(const char *, int);
+static pfn_dlsym_t  real_dlsym_fn  = NULL;
+static pfn_dlopen_t real_dlopen_fn = NULL;
+
+/* Bootstrap: run before gb_shim_init() to capture real dlsym and dlopen.
+ *
+ * We override both dlsym and dlopen, so we need their real pointers before
+ * our overrides are active.  dlvsym with an explicit version skips our
+ * unversioned overrides and finds the glibc implementations.
+ *
+ * On glibc >= 2.34 (Ubuntu 22.04+) both are at GLIBC_2.34 / GLIBC_2.2.5.
+ * Priority 101 ensures this runs before the default-priority gb_shim_init. */
+__attribute__((constructor(101)))
+static void gb_dlsym_bootstrap(void)
+{
+    /* dlsym — try newest version first */
+    real_dlsym_fn = (pfn_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.34");
+    if (!real_dlsym_fn)
+        real_dlsym_fn = (pfn_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+    if (!real_dlsym_fn)
+        real_dlsym_fn = (pfn_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.17");
+    if (!real_dlsym_fn)
+        real_dlsym_fn = (pfn_dlsym_t)dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.0");
+
+    /* dlopen — same version chain */
+    real_dlopen_fn = (pfn_dlopen_t)dlvsym(RTLD_NEXT, "dlopen", "GLIBC_2.34");
+    if (!real_dlopen_fn)
+        real_dlopen_fn = (pfn_dlopen_t)dlvsym(RTLD_NEXT, "dlopen", "GLIBC_2.2.5");
+    if (!real_dlopen_fn)
+        real_dlopen_fn = (pfn_dlopen_t)dlvsym(RTLD_NEXT, "dlopen", "GLIBC_2.17");
+    if (!real_dlopen_fn)
+        real_dlopen_fn = (pfn_dlopen_t)dlvsym(RTLD_NEXT, "dlopen", "GLIBC_2.0");
+}
+
+/* Return our hook for a given symbol name, or NULL if not intercepted. */
+static void *gb_get_hook(const char *name)
+{
+    if (!name) return NULL;
+
+    /* NVML memory reporting — used by Ollama for initial VRAM discovery */
+    if (strcmp(name, "nvmlDeviceGetMemoryInfo")    == 0) return (void *)nvmlDeviceGetMemoryInfo;
+    if (strcmp(name, "nvmlDeviceGetMemoryInfo_v2") == 0) return (void *)nvmlDeviceGetMemoryInfo_v2;
+
+    /* CUDA device total memory — queried by scheduler at startup */
+    if (strcmp(name, "cuDeviceTotalMem_v2")        == 0) return (void *)cuDeviceTotalMem_v2;
+    if (strcmp(name, "cuDeviceTotalMem")           == 0) return (void *)cuDeviceTotalMem;
+
+    /* CUDA free/total memory info */
+    if (strcmp(name, "cuMemGetInfo_v2")            == 0) return (void *)cuMemGetInfo_v2;
+    if (strcmp(name, "cuMemGetInfo")               == 0) return (void *)cuMemGetInfo;
+    if (strcmp(name, "cudaMemGetInfo")             == 0) return (void *)cudaMemGetInfo;
+
+    /* CUDA allocation — large allocs redirected to DDR4 pool */
+    if (strcmp(name, "cudaMalloc")                 == 0) return (void *)cudaMalloc;
+    if (strcmp(name, "cudaMallocAsync")            == 0) return (void *)cudaMallocAsync;
+    if (strcmp(name, "cudaFree")                   == 0) return (void *)cudaFree;
+    if (strcmp(name, "cuMemAlloc_v2")              == 0) return (void *)cuMemAlloc_v2;
+    if (strcmp(name, "cuMemAllocAsync")            == 0) return (void *)cuMemAllocAsync;
+    if (strcmp(name, "cuMemFree_v2")               == 0) return (void *)cuMemFree_v2;
+
+    return NULL;
+}
+
+void *dlsym(void *handle, const char *name)
+{
+    void *hook;
+
+    /* Only intercept after GreenBoost has fully initialized, and ONLY for
+     * library-specific handles (not RTLD_NEXT).  Our own code uses RTLD_NEXT
+     * to find real implementations — intercepting those causes infinite
+     * recursion (real_cudaMalloc = dlsym(RTLD_NEXT,"cudaMalloc") → our hook
+     * → calls itself). */
+    if (initialized && handle != RTLD_NEXT) {
+        hook = gb_get_hook(name);
+        if (hook) {
+            gb_log("dlsym hook: '%s' → GreenBoost intercepted", name);
+            return hook;
+        }
+    }
+
+    if (real_dlsym_fn)
+        return real_dlsym_fn(handle, name);
+
+    /* Bootstrap failed — return NULL rather than calling the broken
+     * dlvsym(handle,name,"GLIBC_2.0") which returns NULL for all CUDA/NVML
+     * symbols anyway and would silently break the caller's initialization. */
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/*  dlopen hook — strips RTLD_DEEPBIND so LD_PRELOAD hooks stay active */
+/*                                                                      */
+/*  Ollama loads libggml-cuda.so with RTLD_DEEPBIND, which makes CUDA  */
+/*  symbol lookups inside that library prefer libcudart.so (bundled),  */
+/*  completely bypassing our cudaMalloc/cuMemAlloc LD_PRELOAD hooks.   */
+/*  Stripping RTLD_DEEPBIND forces those symbols to resolve from the   */
+/*  global namespace where our overrides are registered first.          */
+/* ------------------------------------------------------------------ */
+
+void *dlopen(const char *filename, int flags)
+{
+    /* RTLD_DEEPBIND = 0x008 on Linux — isolates library from global NS */
+    if (flags & RTLD_DEEPBIND) {
+        flags &= ~RTLD_DEEPBIND;
+        fprintf(stderr,
+                "[GreenBoost] dlopen: stripped RTLD_DEEPBIND from '%s'"
+                " (keeps cudaMalloc/cuMemAlloc hooks active)\n",
+                filename ? filename : "(null)");
+    }
+
+    if (real_dlopen_fn)
+        return real_dlopen_fn(filename, flags);
+
+    /* Fallback: bootstrap hasn't run yet — should never happen since
+     * constructor(101) runs before any user code calls dlopen. */
+    return NULL;
 }

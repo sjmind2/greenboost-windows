@@ -100,7 +100,20 @@ cmd_install_sys_configs() {
         warn "Ollama service not found at $svc — skipping"
     fi
 
-    # 2. NVMe udev rule — scheduler=none, read_ahead=4096, nr_requests=2048
+    # 2a. GreenBoost device udev rule — allow video group (includes ollama) access
+    cat > /etc/udev/rules.d/99-greenboost.rules << 'UDEVEOF'
+# GreenBoost kernel module — allow video group (includes ollama) to access /dev/greenboost
+KERNEL=="greenboost", GROUP="video", MODE="0660"
+UDEVEOF
+    info "GreenBoost device udev rule installed: /etc/udev/rules.d/99-greenboost.rules"
+    # Apply rule immediately to existing /dev/greenboost (if module already loaded)
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --name-match=greenboost 2>/dev/null \
+        || udevadm trigger --subsystem-match=greenboost 2>/dev/null \
+        || true
+    udevadm settle 2>/dev/null || true
+
+    # 2b. NVMe udev rule — scheduler=none, read_ahead=4096, nr_requests=2048
     cat > /etc/udev/rules.d/99-nvme-greenboost.rules << 'UDEVEOF'
 # GreenBoost v2.3 — NVMe tuning for T3 swap performance
 ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/scheduler}="none"
@@ -129,21 +142,26 @@ CPUEOF
     systemctl enable --now cpu-perf.service
     info "CPU governor service installed and started"
 
-    # 4. Hugepages sysfs.d — 51 GB T2 pool pre-allocated at 2MB
+    # 4. THP sysfs.d — transparent hugepages for compaction + THP performance
+    # NOTE: gb_alloc_buf() uses alloc_pages(GFP_KERNEL|__GFP_COMP, order=9) which draws
+    # from the BUDDY ALLOCATOR, NOT the HugeTLB pool.  Pre-allocating HugeTLB pages
+    # (vm.nr_hugepages=26112) locks 51 GB in the HugeTLB pool, leaving <12 GB free RAM,
+    # which triggers the OOM guard and makes T2 unavailable.  Keep nr_hugepages=0.
     mkdir -p /etc/sysfs.d
     cat > /etc/sysfs.d/greenboost-hugepages.conf << 'HPEOF'
-# GreenBoost v2.3 — T2 pool hugepage pre-allocation
-# 51 GB at 2 MB pages = 26112 pages. Allocated at boot before fragmentation.
-kernel/mm/hugepages/hugepages-2048kB/nr_hugepages = 26112
+# GreenBoost v2.3 — THP config (no HugeTLB pre-allocation: gb_alloc_buf uses buddy allocator)
 kernel/mm/transparent_hugepage/enabled = always
-vm/nr_overcommit_hugepages = 4096
 HPEOF
-    info "Hugepages sysfs conf: /etc/sysfs.d/greenboost-hugepages.conf"
+    info "THP sysfs conf: /etc/sysfs.d/greenboost-hugepages.conf"
 
-    # Apply hugepages immediately (may fail if system lacks contiguous memory)
-    echo 26112 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null \
-        && info "Hugepages: $(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) x 2MB allocated" \
-        || warn "Hugepages: immediate allocation failed (will apply at next boot)"
+    # Release any previously locked HugeTLB pages and free them back to buddy allocator
+    if [[ "$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null)" != "0" ]]; then
+        echo 0 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null \
+            && info "HugeTLB pages released: freed $(( $(cat /proc/meminfo | grep HugePages_Total | awk '{print $2}') * 2 )) kB back to buddy allocator" \
+            || warn "Could not set nr_hugepages=0 — reboot to apply"
+    else
+        info "HugeTLB: already 0 (correct — GreenBoost T2 uses buddy allocator)"
+    fi
 
     # 5. VM sysctl — reduce swap pressure, tune write-back
     cat > /etc/sysctl.d/99-greenboost.conf << 'SYSCTLEOF'
@@ -157,7 +175,6 @@ SYSCTLEOF
 
     echo ""
     info "System config installation complete."
-    info "Reboot recommended to activate hugepage pre-allocation."
     warn "Restart Ollama to pick up new env vars: sudo systemctl restart ollama"
 }
 
@@ -894,8 +911,18 @@ cmd_setup_swap() {
             info "Swap file already exists and is large enough ($gb GB): $swap_file"
         else
             local cur_gb=$(( cur_size / 1024 / 1024 / 1024 ))
-            warn "Swap file exists but is only ${cur_gb} GB (want $gb GB)"
-            warn "To expand: swapoff $swap_file && fallocate -l ${gb}G $swap_file && mkswap $swap_file && swapon -p 10 $swap_file"
+            warn "Swap file exists but is only ${cur_gb} GB (want $gb GB) — expanding..."
+            # swapoff only if currently active (swapoff on inactive swap → "Invalid argument")
+            if swapon --show --noheadings 2>/dev/null | grep -q "$swap_file"; then
+                swapoff "$swap_file" || die "swapoff $swap_file failed"
+                info "Swap deactivated for expansion"
+            fi
+            fallocate -l "${gb}G" "$swap_file" 2>/dev/null || \
+                dd if=/dev/zero of="$swap_file" bs=1G count="$gb" status=progress || \
+                die "Failed to expand swap file $swap_file"
+            chmod 600 "$swap_file"
+            mkswap "$swap_file" || die "mkswap failed after expansion"
+            info "Swap file expanded to ${gb} GB"
         fi
     else
         info "Creating ${gb} GB swap file (fallocate — fast on NVMe)..."
@@ -976,19 +1003,29 @@ cmd_full_install() {
     # 7/7 — ExLlamaV3 with GreenBoost patches (optional)
     info "[7/7] ExLlamaV3 + GreenBoost integration..."
     local exllama_dir
+    # Primary: greenboost_enhanced/ (with GreenBoost patches)
     exllama_dir="$(dirname "$MODULE_DIR")/greenboost_enhanced/exllamav3"
+    # Fallback: libraries/exllamav3 (plain upstream ExLlamaV3)
+    if [[ ! -d "$exllama_dir" ]]; then
+        exllama_dir="$MODULE_DIR/libraries/exllamav3"
+    fi
     if [[ -d "$exllama_dir" ]]; then
-        info "Found ExLlamaV3 at $exllama_dir — installing with GreenBoost patches..."
+        info "Found ExLlamaV3 at $exllama_dir"
         # Ensure liburing-dev is present (io_uring stloader)
-        apt-get install -y liburing-dev 2>/dev/null || true
-        # Install ExLlamaV3 in editable mode (no build isolation needed for our patches)
-        STLOADER_USE_URING=1 pip install -e "$exllama_dir" --no-build-isolation \
-            && info "ExLlamaV3 installed (io_uring stloader + GreenBoost cache)" \
-            || warn "ExLlamaV3 install failed — run manually: pip install -e $exllama_dir --no-build-isolation"
+        apt-get install -y liburing-dev python3-venv 2>/dev/null || true
+        # Python 3.12+ (Ubuntu 24.04+) is "externally managed" — use a venv
+        local venv_dir="/opt/greenboost/venv"
+        if [[ ! -d "$venv_dir" ]]; then
+            info "Creating Python venv at $venv_dir..."
+            mkdir -p /opt/greenboost
+            python3 -m venv "$venv_dir" || die "python3 -m venv failed — install python3-venv"
+        fi
+        STLOADER_USE_URING=1 "$venv_dir/bin/pip" install -e "$exllama_dir" --no-build-isolation \
+            && info "ExLlamaV3 installed in $venv_dir" \
+            || warn "ExLlamaV3 install failed — run manually: STLOADER_USE_URING=1 $venv_dir/bin/pip install -e $exllama_dir --no-build-isolation"
+        info "To use ExLlamaV3: source $venv_dir/bin/activate"
     else
-        warn "ExLlamaV3 not found at $exllama_dir"
-        warn "Set up greenboost_enhanced/exllamav3/ then run:"
-        warn "  STLOADER_USE_URING=1 pip install -e $exllama_dir --no-build-isolation"
+        warn "ExLlamaV3 not found. Place it at $MODULE_DIR/libraries/exllamav3/ then re-run."
     fi
     echo ""
 
@@ -1130,6 +1167,14 @@ cmd_diagnose() {
         elif echo "$shim_out" | grep -q "UVM overflow.*unavailable"; then
             _warn "Shim init: UVM overflow unavailable — load nvidia_uvm"
         fi
+        # Check dlsym hook present (v2.3+) — required to intercept dlopen+dlsym GPU API calls
+        if strings "$shim" 2>/dev/null | grep -q "dlsym hook"; then
+            _chk "dlsym hook present (intercepts Ollama dlopen+dlsym GPU API calls)"
+        else
+            _fail "dlsym hook MISSING — Ollama NVML/CUDA discovery sees only physical VRAM"
+            _info "Rebuild shim: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
+            _rec "Rebuild shim v2.3: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
+        fi
     fi
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1162,6 +1207,23 @@ cmd_diagnose() {
     _info "OLLAMA_NUM_CTX=${ctx:-default}"
     _L "ctx=$ctx  kv_type=$kv_type"
 
+    # Check what VRAM Ollama reported at startup (dlsym hook effectiveness)
+    local vram_reported; vram_reported=$(journalctl -u ollama --since '1 hour ago' --no-pager 2>/dev/null \
+        | grep 'inference compute' | tail -1 | grep -oP 'total="\K[^"]+')
+    if [[ -n "$vram_reported" ]]; then
+        _info "Ollama sees GPU VRAM: $vram_reported"
+        # Extract numeric GiB value
+        local vram_gib; vram_gib=$(echo "$vram_reported" | grep -oP '[\d.]+')
+        if (( $(echo "$vram_gib > 20" | bc -l 2>/dev/null || echo 0) )); then
+            _chk "Virtual VRAM visible to Ollama: $vram_reported (GreenBoost dlsym hook working)"
+        else
+            _warn "Ollama sees only physical VRAM: $vram_reported — dlsym hook may not be active"
+            _rec "Rebuild + redeploy shim: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh"
+        fi
+    else
+        _info "No recent Ollama GPU discovery log — restart Ollama to verify VRAM reporting"
+    fi
+
     local nthreads; nthreads=$(echo "$env_str" | grep -oP 'OLLAMA_NUM_THREADS=\d+' | cut -d= -f2 | head -1)
     _info "OLLAMA_NUM_THREADS=${nthreads:-default}  (i9-14900KF: 8=P-cores-only, 16=P+E)"
     if [[ -n "$nthreads" && "$nthreads" -gt 16 ]]; then
@@ -1188,14 +1250,18 @@ cmd_diagnose() {
         && _chk "THP: always (2MB hugepages enabled)" \
         || { _warn "THP: ${thp:-unknown} (needs 'always' for GreenBoost T2 pool)"; _rec "echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled"; }
 
-    # Hugepages
-    local hp_total hp_free
+    # HugeTLB pages — must be 0 (GreenBoost uses buddy allocator, not HugeTLB pool)
+    # Pre-allocating HugeTLB pages locks RAM away from the buddy allocator, making
+    # the OOM guard always fire and blocking all T2 DDR4 allocations.
+    local hp_total
     hp_total=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || echo 0)
-    hp_free=$(cat  /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages  2>/dev/null || echo 0)
-    local hp_gb=$(( hp_total * 2 / 1024 ))
-    [[ $hp_total -ge 1000 ]] \
-        && _chk "Hugepages: ${hp_total} × 2MB = ${hp_gb} GB (${hp_free} free)" \
-        || { _warn "Hugepages: only $hp_total allocated (target 26112 = 51 GB for T2)"; _rec "Reboot after full-install to pre-allocate hugepages"; }
+    if [[ $hp_total -eq 0 ]]; then
+        _chk "HugeTLB nr_hugepages=0 (correct: T2 uses buddy allocator alloc_pages, not HugeTLB)"
+    else
+        local hp_gb=$(( hp_total * 2 / 1024 ))
+        _warn "HugeTLB: ${hp_total} × 2MB = ${hp_gb} GB locked (OOM guard will always fire — T2 unavailable)"
+        _rec  "Free HugeTLB pages: echo 0 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages && sudo ./greenboost_setup.sh install-sys-configs"
+    fi
 
     # NVMe scheduler
     local nvme_sched; nvme_sched=$(cat /sys/block/nvme0n1/queue/scheduler 2>/dev/null | grep -oP '\[\K[^\]]+')
@@ -1252,11 +1318,12 @@ except:
         local PROMPT="List all 8 planets of the solar system in order from the Sun, one per line, prefixed with their number."
         local test_start; test_start=$(date --iso-8601=seconds)
 
-        _info "Sending inference request (stream=false, num_predict=150)..."
+        # num_gpu=999 forces all layers to GPU so the shim can route DDR4 overflow
+        _info "Sending inference request (stream=false, num_predict=150, num_gpu=999)..."
         local response; response=$(curl -s --max-time 400 \
             http://127.0.0.1:11434/api/generate \
             -H "Content-Type: application/json" \
-            -d "{\"model\": \"$model\", \"prompt\": \"$PROMPT\", \"stream\": false, \"options\": {\"num_predict\": 150}}" \
+            -d "{\"model\": \"$model\", \"prompt\": \"$PROMPT\", \"stream\": false, \"options\": {\"num_predict\": 150, \"num_gpu\": 999}}" \
             2>/dev/null)
 
         if [[ -z "$response" ]]; then
@@ -1264,8 +1331,9 @@ except:
             return
         fi
 
-        # Parse timing + response via python3
-        local parsed; parsed=$(python3 - <<'PYEOF'
+        # Parse timing + response — pipe $response to python3 stdin
+        # (heredoc + <<< redirection conflict in bash; use echo pipe instead)
+        local parsed; parsed=$(echo "$response" | python3 -c "
 import sys, json
 try:
     d = json.loads(sys.stdin.read())
@@ -1280,17 +1348,16 @@ try:
     planets = ['Mercury','Venus','Earth','Mars','Jupiter','Saturn','Uranus','Neptune']
     found   = sum(1 for p in planets if p.lower() in r.lower())
     snippet = r[:100].replace('\n', ' ')
-    print(f"load_s={ln/1e9:.2f}")
-    print(f"ttft_s={pn/1e9:.2f}")
-    print(f"tps={tps:.2f}")
-    print(f"eval_tokens={ec}")
-    print(f"total_s={tn/1e9:.2f}")
-    print(f"quality={found}/8")
-    print(f"snippet={snippet}")
+    print(f'load_s={ln/1e9:.2f}')
+    print(f'ttft_s={pn/1e9:.2f}')
+    print(f'tps={tps:.2f}')
+    print(f'eval_tokens={ec}')
+    print(f'total_s={tn/1e9:.2f}')
+    print(f'quality={found}/8')
+    print(f'snippet={snippet}')
 except Exception as e:
-    print(f"parse_error={e}")
-PYEOF
-        <<< "$response")
+    print(f'parse_error={e}')
+" 2>/dev/null)
 
         local load_s ttft_s tps eval_tokens total_s quality snippet
         load_s=$(     echo "$parsed" | grep "^load_s="      | cut -d= -f2)
@@ -1321,14 +1388,23 @@ PYEOF
         _info "Snippet        : $snippet"
         _L    "benchmark model=$model load_s=$load_s ttft_s=$ttft_s tps=$tps eval_tokens=$eval_tokens gpu_layers=$gpu_layers vram_delta=$vram_delta quality=$quality"
 
-        # Evaluate GPU offload
-        if [[ "$gpu_layers" == "0/"* ]]; then
+        # Evaluate GPU offload — extract numerator/denominator
+        local gpu_n gpu_total
+        gpu_n=$(     echo "$gpu_layers" | cut -d/ -f1 2>/dev/null || echo 0)
+        gpu_total=$( echo "$gpu_layers" | cut -d/ -f2 2>/dev/null || echo 48)
+        [[ -z "$gpu_total" || "$gpu_total" == "$gpu_layers" ]] && gpu_total=48
+        [[ -z "$gpu_n" ]] && gpu_n=0
+
+        if [[ "$gpu_layers" == "?" ]]; then
+            _warn "Could not read GPU layer count — check: journalctl -u ollama | grep offloaded"
+        elif [[ "$gpu_n" -eq 0 ]]; then
             _fail "0 GPU layers — model running CPU-ONLY (GreenBoost DDR4 overflow not working)"
             _rec  "Fix shim: cd $MODULE_DIR && make shim && sudo ./deploy_fix.sh && sudo systemctl restart ollama"
-        elif [[ "$gpu_layers" == "?" ]]; then
-            _warn "Could not read GPU layer count from logs — check: journalctl -u ollama | grep offloaded"
+        elif [[ "$gpu_n" -lt "$gpu_total" ]]; then
+            _warn "Partial GPU offload: $gpu_layers layers (expected $gpu_total/$(echo $gpu_total)) — cuDeviceTotalMem hook missing or num_gpu not passed"
+            _rec  "Rebuild shim: make shim && sudo cp libgreenboost_cuda.so /usr/local/lib/ && sudo systemctl restart ollama"
         else
-            _chk  "GPU offload: $gpu_layers layers via GreenBoost DDR4 overflow"
+            _chk  "Full GPU offload: $gpu_layers layers (all layers via GreenBoost DDR4 overflow)"
         fi
 
         # Evaluate throughput

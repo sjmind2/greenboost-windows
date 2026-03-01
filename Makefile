@@ -24,8 +24,9 @@ all: module shim
 module:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
-shim: greenboost_cuda_shim.c
-	$(CC) -shared -fPIC -O2 -o $(SHIM) greenboost_cuda_shim.c -ldl -lpthread
+shim: greenboost_cuda_shim.c greenboost_cuda.map
+	$(CC) -shared -fPIC -O2 -o $(SHIM) greenboost_cuda_shim.c -ldl -lpthread \
+		-Wl,--version-script=greenboost_cuda.map
 	@echo "[GreenBoost] Built $(SHIM)"
 
 clean:
@@ -59,6 +60,12 @@ load: module
 		safety_reserve_gb=$(RESERVE_GB) \
 		nvme_swap_gb=$(NVME_GB) \
 		nvme_pool_gb=$(NVME_POOL)
+	@# Apply udev permissions so ollama (video group) can open /dev/greenboost
+	@if [ -f /etc/udev/rules.d/99-greenboost.rules ]; then \
+		sudo udevadm trigger --name-match=greenboost 2>/dev/null || true; \
+	else \
+		sudo chmod 660 /dev/greenboost && sudo chgrp video /dev/greenboost 2>/dev/null || true; \
+	fi
 	@echo "[GreenBoost] v2.2 loaded — 3-tier pool:"
 	@echo "[GreenBoost]   T1 VRAM  : $(PHYS_GB) GB  RTX 5070"
 	@echo "[GreenBoost]   T2 DDR4  : $(VIRT_GB) GB  pool"
