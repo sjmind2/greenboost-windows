@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * GreenBoost v2.2 — 3-Tier GPU Memory Pool via DMA-BUF + CUDA UVM
+ * GreenBoost v2.3 — 3-Tier GPU Memory Pool via DMA-BUF + CUDA UVM
  *
  * Tier 1 — RTX 5070 GDDR7 12 GB        ~336 GB/s  (192-bit @ 14 Gbps)
  * Tier 2 — DDR4-3600 dual-ch 51 GB     ~57.6 GB/s local / ~32 GB/s via PCIe 4.0 x16
@@ -45,12 +45,13 @@
 #include <linux/swap.h>           /* get_nr_swap_pages()              */
 #include <linux/cpumask.h>        /* cpumask_var_t, set_cpus_allowed  */
 #include <linux/topology.h>       /* num_online_cpus()                */
+#include <linux/eventfd.h>        /* eventfd_ctx_fdget, eventfd_signal */
 #include "greenboost_ioctl.h"
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Ferran Duarri");
-MODULE_DESCRIPTION("GreenBoost v2.2 — 3-tier pool: RTX5070 VRAM + DDR4 + NVMe swap");
-MODULE_VERSION("2.2.0");
+MODULE_DESCRIPTION("GreenBoost v2.3 — 3-tier pool: RTX5070 VRAM + DDR4 + NVMe swap");
+MODULE_VERSION("2.3.0");
 MODULE_IMPORT_NS("DMA_BUF");
 
 /* 2 MiB hugepage constants */
@@ -151,12 +152,18 @@ struct gb_buf {
 	struct page    **hpages;
 	unsigned int     nhpages;
 	/* common */
-	bool             hugepages;   /* which path is active */
-	unsigned int     npages;      /* total in 4K units    */
+	bool             hugepages;   /* which path is active            */
+	unsigned int     npages;      /* total in 4K units               */
 	size_t           size;
 	int              id;          /* IDR id (0 = not yet registered) */
 	int              tier;        /* GB_TIER2_DDR4 or GB_TIER3_NVME  */
 	struct dma_buf  *dmabuf;
+	/* LRU and lifecycle fields (v2.3) */
+	struct list_head  lru_node;     /* link in gb_device.lru_list    */
+	unsigned long     alloc_jiffies;/* jiffies at alloc time         */
+	unsigned long     last_jiffies; /* jiffies of last madvise HOT   */
+	u32               alloc_flags;  /* GB_ALLOC_* flags              */
+	u8                frozen;       /* 1 = never evict from T2       */
 };
 
 /* ------------------------------------------------------------------ */
@@ -182,6 +189,10 @@ struct gb_device {
 	atomic_t         swap_pressure;   /* 0=ok 1=warn 2=critical         */
 
 	struct task_struct *watchdog;
+	/* LRU tracking (v2.3) */
+	struct list_head    lru_list;     /* T2 buffers in LRU order       */
+	spinlock_t          lru_lock;     /* protects lru_list             */
+	struct eventfd_ctx *pressure_efd; /* signaled on pressure change   */
 };
 
 /* Read swap info (MB units).
@@ -257,6 +268,11 @@ static void gb_release(struct dma_buf *dmabuf)
 	gb_dbg("release buffer id=%d size=%zuMB (%s)\n",
 	       buf->id, buf->size >> 20,
 	       buf->hugepages ? "2MB pages" : "4K pages");
+
+	/* Remove from LRU list */
+	spin_lock(&gb_dev.lru_lock);
+	list_del_init(&buf->lru_node);
+	spin_unlock(&gb_dev.lru_lock);
 
 	/* Remove from IDR if registered */
 	if (buf->id > 0) {
@@ -363,7 +379,7 @@ static const struct dma_buf_ops gb_dma_buf_ops = {
 /*  Page pool allocator                                                 */
 /* ------------------------------------------------------------------ */
 
-static struct gb_buf *gb_alloc_buf(size_t size)
+static struct gb_buf *gb_alloc_buf(size_t size, u32 flags)
 {
 	struct gb_buf *buf;
 	unsigned int i, j;
@@ -415,7 +431,7 @@ static struct gb_buf *gb_alloc_buf(size_t size)
 		goto alloc_4k;
 
 	/* --- 2 MB hugepage path (Tier 2 only) --- */
-	if (use_hugepages) {
+	if (use_hugepages && !(flags & GB_ALLOC_NO_HUGEPAGE)) {
 		unsigned int nhp = DIV_ROUND_UP(size, GB_HPAGE_SIZE);
 		size_t hsize    = (size_t)nhp * GB_HPAGE_SIZE;
 
@@ -473,13 +489,24 @@ alloc_4k:
 	}
 
 done:
-	buf->id   = 0;
-	buf->tier = tier3 ? GB_TIER3_NVME : GB_TIER2_DDR4;
+	buf->id          = 0;
+	buf->tier        = tier3 ? GB_TIER3_NVME : GB_TIER2_DDR4;
+	buf->alloc_flags = flags;
+	buf->alloc_jiffies = jiffies;
+	buf->last_jiffies  = jiffies;
+	buf->frozen      = (flags & GB_ALLOC_FROZEN) ? 1 : 0;
+	INIT_LIST_HEAD(&buf->lru_node);
+
 	if (tier3)
 		atomic64_add(buf->size, &gb_dev.nvme_allocated);
 	else
 		atomic64_add(buf->size, &gb_dev.pool_allocated);
 	atomic_inc(&gb_dev.active_bufs);
+
+	spin_lock(&gb_dev.lru_lock);
+	list_add_tail(&buf->lru_node, &gb_dev.lru_list);
+	spin_unlock(&gb_dev.lru_lock);
+
 	return buf;
 }
 
@@ -507,7 +534,7 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -EINVAL;
 
 		/* 1. Pin DDR4 pages */
-		buf = gb_alloc_buf((size_t)req.size);
+		buf = gb_alloc_buf((size_t)req.size, req.flags);
 		if (IS_ERR(buf))
 			return PTR_ERR(buf);
 
@@ -616,6 +643,88 @@ static long gb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			": RESET — close all DMA-BUF fds to release buffers\n");
 		return 0;
 
+	case GB_IOCTL_MADVISE: {
+		struct gb_madvise_req req;
+		struct gb_buf *buf;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+
+		mutex_lock(&gb_dev.lock);
+		buf = idr_find(&gb_dev.idr, req.buf_id);
+		mutex_unlock(&gb_dev.lock);
+		if (!buf)
+			return -ENOENT;
+
+		spin_lock(&gb_dev.lru_lock);
+		switch (req.advise) {
+		case GB_MADVISE_HOT:
+			buf->last_jiffies = jiffies;
+			list_move(&buf->lru_node, &gb_dev.lru_list);  /* to head */
+			break;
+		case GB_MADVISE_COLD:
+			list_move_tail(&buf->lru_node, &gb_dev.lru_list); /* to tail */
+			break;
+		case GB_MADVISE_FREEZE:
+			buf->frozen = 1;
+			break;
+		default:
+			spin_unlock(&gb_dev.lru_lock);
+			return -EINVAL;
+		}
+		spin_unlock(&gb_dev.lru_lock);
+		gb_dbg("madvise buf id=%d advise=%u\n", req.buf_id, req.advise);
+		return 0;
+	}
+
+	case GB_IOCTL_EVICT: {
+		struct gb_evict_req req;
+		struct gb_buf *buf;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+
+		mutex_lock(&gb_dev.lock);
+		buf = idr_find(&gb_dev.idr, req.buf_id);
+		mutex_unlock(&gb_dev.lock);
+		if (!buf)
+			return -ENOENT;
+
+		/* Move T2 accounting to T3 (kernel reclaim handles actual page-out
+		 * for GFP_HIGHUSER 4K pages; hugepage T2 buffers get soft-evicted) */
+		if (buf->tier == GB_TIER2_DDR4) {
+			atomic64_sub(buf->size, &gb_dev.pool_allocated);
+			atomic64_add(buf->size, &gb_dev.nvme_allocated);
+			buf->tier = GB_TIER3_NVME;
+			/* Remove from LRU — evicted buffers are not candidates */
+			spin_lock(&gb_dev.lru_lock);
+			list_del_init(&buf->lru_node);
+			spin_unlock(&gb_dev.lru_lock);
+			gb_dbg("evict buf id=%d: T2→T3 (%zuMB)\n",
+			       buf->id, buf->size >> 20);
+		}
+		return 0;
+	}
+
+	case GB_IOCTL_POLL_FD: {
+		struct gb_poll_req req;
+		struct eventfd_ctx *ctx;
+
+		if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+			return -EFAULT;
+
+		ctx = eventfd_ctx_fdget(req.efd);
+		if (IS_ERR(ctx))
+			return PTR_ERR(ctx);
+
+		/* Replace any previously registered eventfd */
+		if (gb_dev.pressure_efd)
+			eventfd_ctx_put(gb_dev.pressure_efd);
+		gb_dev.pressure_efd = ctx;
+		gb_dbg("pressure eventfd registered (efd=%d)\n", req.efd);
+		return 0;
+	}
+
 	default:
 		return -ENOTTY;
 	}
@@ -655,7 +764,7 @@ static ssize_t pool_info_show(struct device *dev,
 		                                                  "ok";
 
 	return sysfs_emit(buf,
-		"=== GreenBoost v2.2 — 3-Tier Pool Info ===\n"
+		"=== GreenBoost v2.3 — 3-Tier Pool Info ===\n"
 		"\n"
 		"Tier 1  RTX 5070 VRAM      : %4d GB   ~336 GB/s  GDDR7 192-bit  [hot layers]\n"
 		"Tier 2  DDR4 pool cap      : %4d GB   ~57.6 GB/s dual-ch / ~32 GB/s PCIe DMA  [cold layers]\n"
@@ -707,7 +816,7 @@ static ssize_t hw_info_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf,
-		"=== GreenBoost v2.2 — Hardware Topology ===\n"
+		"=== GreenBoost v2.3 — Hardware Topology ===\n"
 		"\n"
 		"CPU  i9-14900KF (Raptor Lake, LGA1700)\n"
 		"  Logical CPUs      : %d total\n"
@@ -814,6 +923,8 @@ static int gb_watchdog(void *unused)
 			old_pressure = atomic_read(&gb_dev.swap_pressure);
 			if (new_pressure != old_pressure) {
 				atomic_set(&gb_dev.swap_pressure, new_pressure);
+				if (gb_dev.pressure_efd)
+					eventfd_signal(gb_dev.pressure_efd);
 				if (new_pressure == GB_SWAP_PRESSURE_CRITICAL)
 					pr_warn(DRIVER_NAME
 						": T3 NVMe swap CRITICAL — "
@@ -868,7 +979,7 @@ static int __init gb_init(void)
 	int ret;
 
 	pr_info(DRIVER_NAME ": =====================================================\n");
-	pr_info(DRIVER_NAME ": GreenBoost v2.2 — 3-Tier GPU Memory Pool\n");
+	pr_info(DRIVER_NAME ": GreenBoost v2.3 — 3-Tier GPU Memory Pool (LRU+eventfd)\n");
 	pr_info(DRIVER_NAME ": Author  : Ferran Duarri\n");
 	pr_info(DRIVER_NAME ": CPU     : i9-14900KF — P-cores CPU 0-%d (golden %d-%d @ 6GHz)\n",
 		pcores_max_cpu, golden_cpu_min, golden_cpu_max);
@@ -889,6 +1000,9 @@ static int __init gb_init(void)
 	atomic64_set(&gb_dev.nvme_allocated, 0);
 	atomic_set(&gb_dev.oom_active, 0);
 	atomic_set(&gb_dev.swap_pressure, GB_SWAP_PRESSURE_OK);
+	INIT_LIST_HEAD(&gb_dev.lru_list);
+	spin_lock_init(&gb_dev.lru_lock);
+	gb_dev.pressure_efd = NULL;
 
 	/* Allocate character device region */
 	ret = alloc_chrdev_region(&gb_dev.devt, 0, 1, DRIVER_NAME);
@@ -976,7 +1090,12 @@ err_chrdev:
 
 static void __exit gb_exit(void)
 {
-	pr_info(DRIVER_NAME ": unloading GreenBoost v2.2\n");
+	pr_info(DRIVER_NAME ": unloading GreenBoost v2.3\n");
+
+	if (gb_dev.pressure_efd) {
+		eventfd_ctx_put(gb_dev.pressure_efd);
+		gb_dev.pressure_efd = NULL;
+	}
 
 	if (gb_dev.watchdog) {
 		kthread_stop(gb_dev.watchdog);

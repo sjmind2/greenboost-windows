@@ -1,4 +1,4 @@
-# GreenBoost v2.2 — Kernel module + CUDA shim build system
+# GreenBoost v2.3 — Kernel module + CUDA shim build system
 # Author: Ferran Duarri
 # 3-tier: RTX 5070 12 GB VRAM | 51 GB DDR4 pool | 576 GB NVMe swap = 639 GB
 

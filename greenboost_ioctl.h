@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0
- * GreenBoost v1.0 — Shared IOCTL definitions (kernel + userspace)
+ * GreenBoost v2.3 — Shared IOCTL definitions (kernel + userspace)
  *
  * Works with both #include <linux/ioctl.h> (kernel) and <sys/ioctl.h> (user).
  *
@@ -23,11 +23,18 @@
   typedef int32_t  gb_s32;
 #endif
 
+/* Allocation flags — stored in gb_alloc_req.flags */
+#define GB_ALLOC_WEIGHTS     (1u << 0)  /* model weight tensor              */
+#define GB_ALLOC_KV_CACHE    (1u << 1)  /* KV cache page                    */
+#define GB_ALLOC_ACTIVATIONS (1u << 2)  /* ephemeral activation buffer      */
+#define GB_ALLOC_FROZEN      (1u << 3)  /* never evict from T2              */
+#define GB_ALLOC_NO_HUGEPAGE (1u << 4)  /* force 4K (for T3-spillable)      */
+
 /* Allocate a pinned DDR4 buffer; returns a DMA-BUF fd the GPU can import */
 struct gb_alloc_req {
 	gb_u64 size;    /* bytes to allocate          (in)  */
 	gb_s32 fd;      /* DMA-BUF fd returned        (out) */
-	gb_u32 flags;   /* reserved, set to 0               */
+	gb_u32 flags;   /* GB_ALLOC_* flags           (in)  */
 };
 
 /* Pool statistics — three-tier memory hierarchy */
@@ -57,10 +64,37 @@ struct gb_info {
 	gb_u64 total_combined_mb;  /* VRAM + DDR4 pool + NVMe swap       */
 };
 
+/* Madvise request — advise the kernel on buffer eviction priority */
+struct gb_madvise_req {
+	gb_s32 buf_id;  /* buffer id from gb_alloc_req.fd → IDR lookup */
+	gb_u32 advise;  /* GB_MADVISE_* constant                       */
+};
+#define GB_MADVISE_COLD   0   /* demote in LRU (evict sooner)        */
+#define GB_MADVISE_HOT    1   /* promote to LRU head (evict later)   */
+#define GB_MADVISE_FREEZE 2   /* pin — never evict while frozen      */
+
+/* Evict request — push a T2 buffer to T3 (NVMe swap) immediately */
+struct gb_evict_req {
+	gb_s32 buf_id;
+	gb_u32 _pad;
+};
+
+/* Poll-fd request — register a userspace eventfd to receive pressure events.
+ * Userspace creates the eventfd: efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)
+ * then passes it here.  Kernel signals it whenever swap pressure changes.
+ */
+struct gb_poll_req {
+	gb_s32 efd;     /* eventfd fd (in — created by caller)         */
+	gb_u32 _pad;
+};
+
 #define GB_IOCTL_MAGIC      'G'
 #define GB_IOCTL_ALLOC      _IOWR(GB_IOCTL_MAGIC, 1, struct gb_alloc_req)
 #define GB_IOCTL_GET_INFO   _IOR( GB_IOCTL_MAGIC, 2, struct gb_info)
 #define GB_IOCTL_RESET      _IO(  GB_IOCTL_MAGIC, 3)
+#define GB_IOCTL_MADVISE    _IOW( GB_IOCTL_MAGIC, 4, struct gb_madvise_req)
+#define GB_IOCTL_EVICT      _IOW( GB_IOCTL_MAGIC, 5, struct gb_evict_req)
+#define GB_IOCTL_POLL_FD    _IOW( GB_IOCTL_MAGIC, 7, struct gb_poll_req)
 
 /* Swap pressure thresholds */
 #define GB_SWAP_PRESSURE_OK       0

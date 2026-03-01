@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GreenBoost v2.2 — Setup & installation script
+# GreenBoost v2.3 — Setup & installation script
 # Author: Ferran Duarri
 # Hardware: ASRock B760M-ITX/D4 | i9-14900KF | RTX 5070 OC | 64 GB DDR4-3600 | Samsung 990 EVO Plus 4 TB
 #
@@ -10,18 +10,19 @@
 #   Combined capacity          639 GB
 #
 # USAGE:
-#   sudo ./greenboost_setup.sh install      — build + install system-wide
-#   sudo ./greenboost_setup.sh uninstall    — remove module + all config
-#   sudo ./greenboost_setup.sh load         — insmod with default params
-#   sudo ./greenboost_setup.sh unload       — rmmod
-#   sudo ./greenboost_setup.sh tune         — runtime tuning (governor, NVMe, sysctl)
-#   sudo ./greenboost_setup.sh tune-grub    — GRUB/boot parameter optimization
-#   sudo ./greenboost_setup.sh tune-sysctl  — consolidate + enhance sysctl (persistent)
-#   sudo ./greenboost_setup.sh tune-libs    — install missing AI/compute libraries
-#   sudo ./greenboost_setup.sh tune-all     — run all tune-* commands
-#        ./greenboost_setup.sh status       — show pool info + system state
-#        ./greenboost_setup.sh build        — build only (no install)
-#        ./greenboost_setup.sh help         — show this help
+#   sudo ./greenboost_setup.sh install          — build + install system-wide
+#   sudo ./greenboost_setup.sh uninstall        — remove module + all config
+#   sudo ./greenboost_setup.sh load             — insmod with default params
+#   sudo ./greenboost_setup.sh unload           — rmmod
+#   sudo ./greenboost_setup.sh install-sys-configs — install v2.3 system config files
+#   sudo ./greenboost_setup.sh tune             — runtime tuning (governor, NVMe, sysctl)
+#   sudo ./greenboost_setup.sh tune-grub        — GRUB/boot parameter optimization
+#   sudo ./greenboost_setup.sh tune-sysctl      — consolidate + enhance sysctl (persistent)
+#   sudo ./greenboost_setup.sh tune-libs        — install missing AI/compute libraries
+#   sudo ./greenboost_setup.sh tune-all         — run all tune-* commands
+#        ./greenboost_setup.sh status           — show pool info + system state
+#        ./greenboost_setup.sh build            — build only (no install)
+#        ./greenboost_setup.sh help             — show this help
 #
 # ENVIRONMENT (for load command):
 #   GPU_PHYS_GB=12     physical VRAM in GB       (RTX 5070 default)
@@ -77,8 +78,90 @@ check_deps() {
 
 # ---- Commands ----------------------------------------------------------
 
+cmd_install_sys_configs() {
+    need_root install-sys-configs
+
+    info "Installing GreenBoost v2.3 system configuration files..."
+
+    # 1. Ollama service — inject GreenBoost env vars + LD_PRELOAD
+    local svc="/etc/systemd/system/ollama.service"
+    if [[ -f "$svc" ]]; then
+        # Add environment lines if not already present
+        if ! grep -q "GREENBOOST_VRAM_HEADROOM_MB" "$svc"; then
+            sed -i '/^\[Service\]/a Environment="OLLAMA_FLASH_ATTENTION=1"\nEnvironment="OLLAMA_KV_CACHE_TYPE=q8_0"\nEnvironment="OLLAMA_NUM_CTX=131072"\nEnvironment="OLLAMA_MAX_LOADED_MODELS=1"\nEnvironment="OLLAMA_KEEP_ALIVE=-1"\nEnvironment="GREENBOOST_VRAM_HEADROOM_MB=1024"\nEnvironment="GREENBOOST_DEBUG=0"\nEnvironment="LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so"' "$svc"
+            info "Ollama service: GreenBoost env vars injected"
+        else
+            info "Ollama service: already configured (skip)"
+        fi
+        systemctl daemon-reload
+        info "Ollama service: daemon-reload done"
+    else
+        warn "Ollama service not found at $svc — skipping"
+    fi
+
+    # 2. NVMe udev rule — scheduler=none, read_ahead=4096, nr_requests=2048
+    cat > /etc/udev/rules.d/99-nvme-greenboost.rules << 'UDEVEOF'
+# GreenBoost v2.3 — NVMe tuning for T3 swap performance
+ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/scheduler}="none"
+ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/read_ahead_kb}="4096"
+ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/nr_requests}="2048"
+UDEVEOF
+    udevadm control --reload-rules && udevadm trigger || true
+    info "NVMe udev rule installed: /etc/udev/rules.d/99-nvme-greenboost.rules"
+
+    # 3. CPU governor service — P-cores only (E-cores stay on powersave)
+    cat > /etc/systemd/system/cpu-perf.service << 'CPUEOF'
+[Unit]
+Description=GreenBoost CPU performance governor (P-cores 0-15)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'for cpu in $(seq 0 15); do echo performance > /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor; done'
+ExecStop=/bin/bash  -c 'for cpu in $(seq 0 15); do echo powersave  > /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor; done'
+
+[Install]
+WantedBy=multi-user.target
+CPUEOF
+    systemctl daemon-reload
+    systemctl enable --now cpu-perf.service
+    info "CPU governor service installed and started"
+
+    # 4. Hugepages sysfs.d — 51 GB T2 pool pre-allocated at 2MB
+    mkdir -p /etc/sysfs.d
+    cat > /etc/sysfs.d/greenboost-hugepages.conf << 'HPEOF'
+# GreenBoost v2.3 — T2 pool hugepage pre-allocation
+# 51 GB at 2 MB pages = 26112 pages. Allocated at boot before fragmentation.
+kernel/mm/hugepages/hugepages-2048kB/nr_hugepages = 26112
+kernel/mm/transparent_hugepage/enabled = always
+vm/nr_overcommit_hugepages = 4096
+HPEOF
+    info "Hugepages sysfs conf: /etc/sysfs.d/greenboost-hugepages.conf"
+
+    # Apply hugepages immediately (may fail if system lacks contiguous memory)
+    echo 26112 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null \
+        && info "Hugepages: $(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) x 2MB allocated" \
+        || warn "Hugepages: immediate allocation failed (will apply at next boot)"
+
+    # 5. VM sysctl — reduce swap pressure, tune write-back
+    cat > /etc/sysctl.d/99-greenboost.conf << 'SYSCTLEOF'
+# GreenBoost v2.3 — VM tuning for 3-tier model pool
+vm.swappiness = 5
+vm.dirty_ratio = 20
+vm.dirty_background_ratio = 5
+SYSCTLEOF
+    sysctl -p /etc/sysctl.d/99-greenboost.conf 2>&1 | sed 's/^/  /'
+    info "sysctl conf installed: /etc/sysctl.d/99-greenboost.conf"
+
+    echo ""
+    info "System config installation complete."
+    info "Reboot recommended to activate hugepage pre-allocation."
+    warn "Restart Ollama to pick up new env vars: sudo systemctl restart ollama"
+}
+
 cmd_build() {
-    info "Building GreenBoost v2.2 (3-tier: VRAM + DDR4 + NVMe)..."
+    info "Building GreenBoost v2.3 (3-tier: VRAM + DDR4 + NVMe)..."
     make -C "$MODULE_DIR" all || die "Build failed — check output above"
     info "Build complete:"
     info "  Kernel module : $MODULE_DIR/greenboost.ko"
@@ -100,7 +183,7 @@ cmd_install() {
     # modprobe defaults
     info "Writing /etc/modprobe.d/greenboost.conf ..."
     cat > /etc/modprobe.d/greenboost.conf << 'MODEOF'
-# GreenBoost v2.2 — 3-tier pool: RTX 5070 VRAM + DDR4 + NVMe swap
+# GreenBoost v2.3 — 3-tier pool: RTX 5070 VRAM + DDR4 + NVMe swap
 # Tier 1: physical_vram_gb=12   RTX 5070 (12 GB GDDR7)
 # Tier 2: virtual_vram_gb=51    DDR4 pool (80% of 64 GB, hugepages)
 #          safety_reserve_gb=12  always keep ≥12 GB free in RAM
@@ -111,7 +194,7 @@ MODEOF
 
     # profile.d helper
     cat > /etc/profile.d/greenboost.sh << PROFEOF
-# GreenBoost v2.2 — shell helpers
+# GreenBoost v2.3 — shell helpers
 export GREENBOOST_SHIM="$SHIM_DEST/$SHIM_LIB"
 greenboost-run() { LD_PRELOAD="\$GREENBOOST_SHIM" "\$@"; }
 export -f greenboost-run
@@ -156,7 +239,7 @@ cmd_load() {
         nvme_pool_gb="$nvme_pool" \
         || die "insmod failed — check: dmesg | tail -20"
 
-    info "GreenBoost v2.2 loaded — 3-tier pool active!"
+    info "GreenBoost v2.3 loaded — 3-tier pool active!"
     info ""
     info "  T1 RTX 5070 VRAM : ${phys} GB   ~336 GB/s  [hot layers]"
     info "  T2 DDR4 pool     : ${virt} GB    ~50 GB/s  [cold layers]"
@@ -445,7 +528,7 @@ cmd_tune_sysctl() {
     echo ""
 
     cat > "$dest" << 'SYSCTL_EOF'
-# GreenBoost v2.2 — Definitive sysctl config
+# GreenBoost v2.3 — Definitive sysctl config
 # Hardware: i9-14900KF | RTX 5070 | 64 GB DDR4-3600 | Samsung 990 EVO Plus 4 TB
 # Loaded last (99-zzz) — wins all conflicts with earlier sysctl.d files.
 # Do NOT edit other sysctl.d files; make changes here instead.
@@ -654,7 +737,7 @@ cmd_tune_libs() {
 
 cmd_tune_all() {
     need_root tune-all
-    info "Running full system tuning for GreenBoost v2.2..."
+    info "Running full system tuning for GreenBoost v2.3..."
     echo ""
     cmd_tune
     echo ""
@@ -670,7 +753,7 @@ cmd_tune_all() {
 
 cmd_status() {
     echo ""
-    echo -e "${BLU}=== GreenBoost v2.2 Status (3-tier pool) ===${NC}"
+    echo -e "${BLU}=== GreenBoost v2.3 Status (3-tier pool) ===${NC}"
     echo ""
 
     if lsmod | grep -q "^${DRIVER_NAME} "; then
@@ -693,7 +776,7 @@ cmd_status() {
 
 cmd_help() {
     echo ""
-    echo -e "${BLU}GreenBoost v2.2 — 3-Tier GPU Memory Pool${NC}"
+    echo -e "${BLU}GreenBoost v2.3 — 3-Tier GPU Memory Pool${NC}"
     echo "Author : Ferran Duarri"
     echo "Target : ASUS RTX 5070 12 GB + 64 GB DDR4-3600 + 4 TB Samsung 990 Evo Plus NVMe"
     echo ""
@@ -749,17 +832,18 @@ cmd_help() {
 
 COMMAND="${1:-help}"
 case "$COMMAND" in
-    install)   cmd_install   ;;
-    uninstall) cmd_uninstall ;;
-    build)     cmd_build     ;;
-    load)      cmd_load      ;;
-    unload)    cmd_unload    ;;
-    tune)         cmd_tune         ;;
-    tune-grub)    cmd_tune_grub    ;;
-    tune-sysctl)  cmd_tune_sysctl  ;;
-    tune-libs)    cmd_tune_libs    ;;
-    tune-all)     cmd_tune_all     ;;
-    status)       cmd_status       ;;
-    help|--help|-h) cmd_help       ;;
+    install)            cmd_install            ;;
+    uninstall)          cmd_uninstall          ;;
+    build)              cmd_build              ;;
+    load)               cmd_load               ;;
+    unload)             cmd_unload             ;;
+    install-sys-configs) cmd_install_sys_configs ;;
+    tune)               cmd_tune               ;;
+    tune-grub)          cmd_tune_grub          ;;
+    tune-sysctl)        cmd_tune_sysctl        ;;
+    tune-libs)          cmd_tune_libs          ;;
+    tune-all)           cmd_tune_all           ;;
+    status)             cmd_status             ;;
+    help|--help|-h)     cmd_help               ;;
     *) die "Unknown command: '$COMMAND'  — use: $0 help" ;;
 esac
