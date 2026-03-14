@@ -82,18 +82,18 @@ net but in practice the model + KV cache at 32K context fits comfortably in T1+T
 
 ---
 
-## What I studied to build this
+## What this code is based on 
 
-I spent a lot of time reading NVIDIA's open-source kernel module code
+ NVIDIA's open-source kernel module sourcecode had been explored
 (`nvidia/open-gpu-kernel-modules`) to understand how UVM page fault handling works and how
 CUDA external memory imports are expected to behave. That code was invaluable for getting
 the DMA-BUF import path right. I want to be clear that I didn't copy any of it — I studied
 the architecture and wrote my own implementation, but the public NVIDIA driver source was
 a critical reference.
 
-I also looked at how `llama.cpp` handles CPU offload, how ExLlamaV2/V3 structures its KV
+Also check at how `llama.cpp` handles CPU offload, how ExLlamaV2/V3 structures its KV
 cache, and how vLLM's paged attention allocates memory. Understanding those patterns helped
-me figure out where in the allocation lifecycle to intercept.
+figure out where in the allocation lifecycle to intercept.
 
 ---
 

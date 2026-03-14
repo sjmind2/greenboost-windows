@@ -1190,15 +1190,25 @@ cmd_full_install() {
         info "Creating Python venv at $venv_dir ..."
         python3 -m venv "$venv_dir" || die "python3 -m venv failed — install python3-venv"
     fi
+
+    # Bootstrap pip (Ubuntu 26.04 venvs ship without pip by default)
+    if ! "$venv_dir/bin/python" -m pip --version &>/dev/null 2>&1; then
+        info "Bootstrapping pip in venv ..."
+        "$venv_dir/bin/python" -m ensurepip --upgrade \
+            || die "ensurepip failed — install python3-pip: apt-get install -y python3-pip"
+    fi
+    # Always upgrade pip to avoid stale metadata issues
+    "$venv_dir/bin/python" -m pip install --upgrade pip -q
+
     chmod -R 755 /opt/greenboost
 
     # Install ExLlamaV3 from bundled library
     if [[ -d "$exllama_dir" ]]; then
         info "Installing ExLlamaV3 from $exllama_dir ..."
-        STLOADER_USE_URING=1 "$venv_dir/bin/pip" install -e "$exllama_dir" \
+        STLOADER_USE_URING=1 "$venv_dir/bin/python" -m pip install -e "$exllama_dir" \
             --no-build-isolation -q \
             && info "ExLlamaV3 installed." \
-            || warn "ExLlamaV3 install failed — re-run: STLOADER_USE_URING=1 $venv_dir/bin/pip install -e $exllama_dir --no-build-isolation"
+            || warn "ExLlamaV3 install failed — re-run: STLOADER_USE_URING=1 $venv_dir/bin/python -m pip install -e $exllama_dir --no-build-isolation"
     else
         warn "ExLlamaV3 not found at $exllama_dir — skipping."
     fi
@@ -1208,14 +1218,14 @@ cmd_full_install() {
         info "kvpress already installed."
     else
         info "Installing kvpress ..."
-        "$venv_dir/bin/pip" install kvpress -q \
+        "$venv_dir/bin/python" -m pip install kvpress -q \
             && info "kvpress installed." \
-            || warn "kvpress install failed — run: $venv_dir/bin/pip install kvpress"
+            || warn "kvpress install failed — run: $venv_dir/bin/python -m pip install kvpress"
     fi
 
     # Install core ML tools used by greenboost-ptq.py and greenboost-lora-train.py
     info "Installing trl, datasets (used by LoRA tools) ..."
-    "$venv_dir/bin/pip" install trl datasets -q 2>/dev/null || true
+    "$venv_dir/bin/python" -m pip install trl datasets -q 2>/dev/null || true
 
     info "Python venv ready: $venv_dir"
     info "Activate with:  source $venv_dir/bin/activate"
