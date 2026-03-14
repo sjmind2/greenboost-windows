@@ -1213,11 +1213,13 @@ cmd_full_install() {
     if [[ -d "$exllama_dir" ]]; then
         info "Installing ExLlamaV3 from $exllama_dir ..."
         warn "This may take 10-30 min on first run (flash-attn CUDA compilation)."
-        PATH="$venv_dir/bin:$PATH" STLOADER_USE_URING=1 \
+        PATH="$venv_dir/bin:$PATH" \
+            PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 \
+            STLOADER_USE_URING=1 \
             "$venv_dir/bin/python" -m pip install -e "$exllama_dir" \
             --no-build-isolation \
             && info "ExLlamaV3 installed." \
-            || warn "ExLlamaV3 install failed — re-run: PATH=$venv_dir/bin:\$PATH STLOADER_USE_URING=1 $venv_dir/bin/python -m pip install -e $exllama_dir --no-build-isolation"
+            || warn "ExLlamaV3 install failed — re-run: PATH=$venv_dir/bin:\$PATH PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 STLOADER_USE_URING=1 $venv_dir/bin/python -m pip install -e $exllama_dir --no-build-isolation"
     else
         warn "ExLlamaV3 not found at $exllama_dir — skipping."
     fi
