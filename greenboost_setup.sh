@@ -1197,8 +1197,9 @@ cmd_full_install() {
         "$venv_dir/bin/python" -m ensurepip --upgrade \
             || die "ensurepip failed — install python3-pip: apt-get install -y python3-pip"
     fi
-    # Always upgrade pip to avoid stale metadata issues
-    "$venv_dir/bin/python" -m pip install --upgrade pip -q
+    # Always upgrade pip + install build tools (setuptools/wheel required by
+    # --no-build-isolation; they are NOT included in fresh venvs on Ubuntu 26.04)
+    "$venv_dir/bin/python" -m pip install --upgrade pip setuptools wheel -q
 
     chmod -R 755 /opt/greenboost
 
@@ -1206,7 +1207,7 @@ cmd_full_install() {
     if [[ -d "$exllama_dir" ]]; then
         info "Installing ExLlamaV3 from $exllama_dir ..."
         STLOADER_USE_URING=1 "$venv_dir/bin/python" -m pip install -e "$exllama_dir" \
-            --no-build-isolation -q \
+            --no-build-isolation \
             && info "ExLlamaV3 installed." \
             || warn "ExLlamaV3 install failed — re-run: STLOADER_USE_URING=1 $venv_dir/bin/python -m pip install -e $exllama_dir --no-build-isolation"
     else
@@ -1218,7 +1219,7 @@ cmd_full_install() {
         info "kvpress already installed."
     else
         info "Installing kvpress ..."
-        "$venv_dir/bin/python" -m pip install kvpress -q \
+        "$venv_dir/bin/python" -m pip install kvpress \
             && info "kvpress installed." \
             || warn "kvpress install failed — run: $venv_dir/bin/python -m pip install kvpress"
     fi
