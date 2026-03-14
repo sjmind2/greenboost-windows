@@ -6,8 +6,8 @@
 # 3-tier memory hierarchy:
 #   Tier 1 — RTX 5070 VRAM      12 GB   ~336 GB/s GDDR7  (hot layers)
 #   Tier 2 — DDR4 pool          51 GB   ~57.6 GB/s dual-ch (cold layers)
-#   Tier 3 — NVMe swap         576 GB   ~7.25 GB/s seq     (frozen pages)
-#   Combined capacity          639 GB
+#   Tier 3 — NVMe swap          64 GB   ~7.25 GB/s seq     (frozen pages, auto-sized)
+#   Combined capacity           75 GB   (T3 expandable up to 200+ GB)
 #
 # USAGE:
 #   sudo ./greenboost_setup.sh install          — build + install system-wide
@@ -29,8 +29,8 @@
 #   GPU_PHYS_GB=12     physical VRAM in GB       (RTX 5070 default)
 #   VIRT_VRAM_GB=51    DDR4 pool size in GB      (80% of 64 GB DDR4)
 #   RESERVE_GB=12      minimum free system RAM to always maintain
-#   NVME_SWAP_GB=576   total NVMe swap capacity  (Samsung 990 Evo Plus)
-#   NVME_POOL_GB=512   GreenBoost soft cap on T3 allocations
+#   NVME_SWAP_GB=64    total NVMe swap capacity  (auto-detected; 64 GB default)
+#   NVME_POOL_GB=58    GreenBoost soft cap on T3 allocations
 
 DRIVER_NAME="greenboost"
 SHIM_LIB="libgreenboost_cuda.so"
@@ -47,6 +47,149 @@ NC='\033[0m'
 info()  { echo -e "${GRN}[GreenBoost]${NC} $*"; }
 warn()  { echo -e "${YLW}[GreenBoost] WARN:${NC} $*"; }
 die()   { echo -e "${RED}[GreenBoost] ERROR:${NC} $*" >&2; exit 1; }
+
+# ---- Hardware detection -----------------------------------------------
+# Populates GB_PHYS, GB_VIRT, GB_RESERVE, GB_NVME_SWAP, GB_NVME_POOL,
+# GB_PCORES_MAX, GB_GOLDEN_MIN, GB_GOLDEN_MAX, GB_PCORES_ONLY,
+# RAM_TYPE, RAM_SPEED_MT, GPU_NAME, CPU_NAME, NVME_SIZE_GB.
+# Safe to call multiple times — idempotent.
+
+detect_hardware() {
+    # ── GPU ──────────────────────────────────────────────────────────────
+    if command -v nvidia-smi &>/dev/null; then
+        local gpu_mem_mib
+        gpu_mem_mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits \
+            2>/dev/null | head -1 | tr -d ' ')
+        GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 \
+            | sed 's/^[[:space:]]*//')
+        GB_PHYS=$(( ${gpu_mem_mib:-12288} / 1024 ))
+        [[ $GB_PHYS -lt 1 ]] && GB_PHYS=1
+    else
+        GPU_NAME="Unknown (nvidia-smi not found)"
+        GB_PHYS=8
+        warn "nvidia-smi not found — assuming 8 GB VRAM. Install NVIDIA driver."
+    fi
+
+    # ── System RAM ───────────────────────────────────────────────────────
+    local total_ram_kb
+    total_ram_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    local total_ram_gb=$(( total_ram_kb / 1024 / 1024 ))
+
+    RAM_TYPE=$(dmidecode -t memory 2>/dev/null \
+        | awk '/^\s*Type:/{t=$2} /^\s*Configured Memory Speed:/{s=$4; print t,s; exit}' \
+        | awk '{print $1}')
+    [[ -z "$RAM_TYPE" || "$RAM_TYPE" == "Unknown" ]] && RAM_TYPE="DDR"
+    RAM_SPEED_MT=$(dmidecode -t memory 2>/dev/null \
+        | awk '/^\s*Configured Memory Speed:/{print $4; exit}')
+    [[ -z "$RAM_SPEED_MT" ]] && RAM_SPEED_MT="?"
+
+    # safety reserve: 15% of RAM, min 8 GB, max 16 GB
+    GB_RESERVE=$(( total_ram_gb * 15 / 100 ))
+    [[ $GB_RESERVE -lt 8  ]] && GB_RESERVE=8
+    [[ $GB_RESERVE -gt 16 ]] && GB_RESERVE=16
+
+    # virtual VRAM pool: 80% of RAM minus safety reserve
+    GB_VIRT=$(( total_ram_gb * 80 / 100 - GB_RESERVE ))
+    [[ $GB_VIRT -lt 4 ]] && GB_VIRT=4
+
+    # ── CPU topology ─────────────────────────────────────────────────────
+    CPU_NAME=$(grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | sed 's/^[[:space:]]*//')
+    local total_cpus; total_cpus=$(nproc)
+
+    # Detect Intel hybrid P/E core split via sysfs core_type
+    local has_ecores=0
+    if ls /sys/devices/system/cpu/cpu*/topology/core_type &>/dev/null; then
+        grep -l "Efficient core" /sys/devices/system/cpu/cpu*/topology/core_type \
+            &>/dev/null && has_ecores=1
+    fi
+
+    if [[ $has_ecores -eq 1 ]]; then
+        # Find highest P-core CPU number
+        GB_PCORES_MAX=0
+        local f ct
+        for f in /sys/devices/system/cpu/cpu*/topology/core_type; do
+            ct=$(cat "$f" 2>/dev/null)
+            if [[ "$ct" == *"Performance core"* ]]; then
+                local cpunum; cpunum=$(echo "$f" | grep -oP 'cpu\K[0-9]+')
+                [[ $cpunum -gt $GB_PCORES_MAX ]] && GB_PCORES_MAX=$cpunum
+            fi
+        done
+        GB_PCORES_ONLY=1
+        # Golden cores: assume last 4 P-core siblings by frequency
+        # For i9-14900KF: CPUs 4-7 are the 6 GHz golden cores
+        local pcores_count=$(( GB_PCORES_MAX + 1 ))
+        GB_GOLDEN_MIN=$(( pcores_count / 4 ))
+        GB_GOLDEN_MAX=$(( pcores_count / 4 + 3 ))
+    else
+        # Non-hybrid (AMD or older Intel): all CPUs are uniform
+        GB_PCORES_MAX=$(( total_cpus - 1 ))
+        GB_PCORES_ONLY=0
+        GB_GOLDEN_MIN=0
+        GB_GOLDEN_MAX=$(( total_cpus > 4 ? 3 : total_cpus - 1 ))
+    fi
+
+    # ── NVMe ─────────────────────────────────────────────────────────────
+    NVME_SIZE_GB=0
+    local name size
+    while read -r name size; do
+        local sz_gb=$(( size / 1024 / 1024 / 1024 ))
+        [[ $sz_gb -gt $NVME_SIZE_GB ]] && NVME_SIZE_GB=$sz_gb
+    done < <(lsblk -b -d -o NAME,SIZE 2>/dev/null | awk '$1~/^nvme/{print $1,$2}')
+    [[ $NVME_SIZE_GB -eq 0 ]] && NVME_SIZE_GB=128  # fallback
+
+    # ── NVMe swap sizing (T3) ─────────────────────────────────────────────
+    # Goal: enough swap as overflow safety net.
+    # For glm-4.7-flash:q8_0 (32GB model): T1+T2 covers it; 64GB is generous.
+    # General formula: 4×VRAM but at least 32 GB and at most 200 GB.
+    GB_NVME_SWAP=$(( GB_PHYS * 4 ))
+    [[ $GB_NVME_SWAP -lt 32  ]] && GB_NVME_SWAP=32
+    [[ $GB_NVME_SWAP -gt 200 ]] && GB_NVME_SWAP=200
+    # Never allocate more than half the NVMe drive
+    local half_nvme=$(( NVME_SIZE_GB / 2 ))
+    [[ $GB_NVME_SWAP -gt $half_nvme && $half_nvme -gt 32 ]] && GB_NVME_SWAP=$half_nvme
+
+    GB_NVME_POOL=$(( GB_NVME_SWAP * 9 / 10 ))
+
+    # ── Ollama CTX based on available pool ───────────────────────────────
+    # Heuristic: large context needs ~12GB KV cache; use 131K if pool >= 40 GB
+    local total_pool=$(( GB_PHYS + GB_VIRT ))
+    if   [[ $total_pool -ge 40 ]]; then GB_OLLAMA_CTX=131072
+    elif [[ $total_pool -ge 24 ]]; then GB_OLLAMA_CTX=65536
+    elif [[ $total_pool -ge 16 ]]; then GB_OLLAMA_CTX=32768
+    else                                 GB_OLLAMA_CTX=16384
+    fi
+}
+
+print_detected_hardware() {
+    info "Detected hardware:"
+    info "  GPU   : ${GPU_NAME}  (${GB_PHYS} GB VRAM)"
+    info "  RAM   : ${RAM_TYPE}-${RAM_SPEED_MT} MT/s  ->  pool ${GB_VIRT} GB  (reserve ${GB_RESERVE} GB)"
+    info "  CPU   : ${CPU_NAME}"
+    info "  NVMe  : ${NVME_SIZE_GB} GB  ->  swap ${GB_NVME_SWAP} GB"
+    info "  Pool  : T1=${GB_PHYS}GB + T2=${GB_VIRT}GB + T3=${GB_NVME_SWAP}GB = $(( GB_PHYS + GB_VIRT + GB_NVME_SWAP )) GB"
+    info "  CTX   : OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}"
+}
+
+# Owner-workstation preset — hard-coded optimal for known hardware:
+# ASRock B760M-ITX/D4 | i9-14900KF | RTX 5070 OC 12GB | 64GB DDR4-3600 dual-ch | Samsung 990 EVO Plus 4TB
+set_owner_workstation_params() {
+    GPU_NAME="ASUS RTX 5070 OC (GB205)"
+    CPU_NAME="Intel Core i9-14900KF (8Px2HT + 16E = 32 logical, golden CPU 4-7 @ 6GHz)"
+    RAM_TYPE="DDR4"
+    RAM_SPEED_MT="3600"
+    NVME_SIZE_GB=4000
+    GB_PHYS=12
+    GB_VIRT=51
+    GB_RESERVE=12
+    GB_NVME_SWAP=64
+    GB_NVME_POOL=58
+    GB_PCORES_MAX=15
+    GB_GOLDEN_MIN=4
+    GB_GOLDEN_MAX=7
+    GB_PCORES_ONLY=1
+    GB_OLLAMA_CTX=131072
+    info "Owner-workstation preset applied (i9-14900KF | RTX 5070 12GB | 64GB DDR4-3600 | 4TB NVMe)"
+}
 
 # ---- Helpers -----------------------------------------------------------
 
@@ -87,6 +230,7 @@ check_deps() {
 
 cmd_install_sys_configs() {
     need_root install-sys-configs
+    detect_hardware
 
     info "Installing GreenBoost v2.3 system configuration files..."
 
@@ -95,7 +239,7 @@ cmd_install_sys_configs() {
     if [[ -f "$svc" ]]; then
         # Add environment lines if not already present
         if ! grep -q "GREENBOOST_VRAM_HEADROOM_MB" "$svc"; then
-            sed -i '/^\[Service\]/a Environment="OLLAMA_FLASH_ATTENTION=1"\nEnvironment="OLLAMA_KV_CACHE_TYPE=q8_0"\nEnvironment="OLLAMA_NUM_CTX=131072"\nEnvironment="OLLAMA_MAX_LOADED_MODELS=1"\nEnvironment="OLLAMA_KEEP_ALIVE=-1"\nEnvironment="GREENBOOST_VRAM_HEADROOM_MB=1024"\nEnvironment="GREENBOOST_DEBUG=0"\nEnvironment="LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so"' "$svc"
+            sed -i "/^\[Service\]/a Environment=\"OLLAMA_FLASH_ATTENTION=1\"\nEnvironment=\"OLLAMA_KV_CACHE_TYPE=q8_0\"\nEnvironment=\"OLLAMA_NUM_CTX=${GB_OLLAMA_CTX}\"\nEnvironment=\"OLLAMA_MAX_LOADED_MODELS=1\"\nEnvironment=\"OLLAMA_KEEP_ALIVE=-1\"\nEnvironment=\"GREENBOOST_VRAM_HEADROOM_MB=2048\"\nEnvironment=\"GREENBOOST_DEBUG=0\"\nEnvironment=\"LD_PRELOAD=/usr/local/lib/libgreenboost_cuda.so\"" "$svc"
             info "Ollama service: GreenBoost env vars injected"
         else
             info "Ollama service: already configured (skip)"
@@ -130,16 +274,16 @@ UDEVEOF
     info "NVMe udev rule installed: /etc/udev/rules.d/99-nvme-greenboost.rules"
 
     # 3. CPU governor service — P-cores only (E-cores stay on powersave)
-    cat > /etc/systemd/system/cpu-perf.service << 'CPUEOF'
+    cat > /etc/systemd/system/cpu-perf.service << CPUEOF
 [Unit]
-Description=GreenBoost CPU performance governor (P-cores 0-15)
+Description=GreenBoost CPU performance governor (P-cores 0-${GB_PCORES_MAX})
 After=multi-user.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c 'for cpu in $(seq 0 15); do echo performance > /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor; done; cset set -c 4-7 -s inference_set || true; cset proc -m -f root -t inference_set -k || true'
-ExecStop=/bin/bash  -c 'for cpu in $(seq 0 15); do echo powersave  > /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor; done; cset set -d inference_set || true'
+ExecStart=/bin/bash -c 'for cpu in \$(seq 0 ${GB_PCORES_MAX}); do echo performance > /sys/devices/system/cpu/cpu\${cpu}/cpufreq/scaling_governor; done; cset set -c ${GB_GOLDEN_MIN}-${GB_GOLDEN_MAX} -s inference_set || true; cset proc -m -f root -t inference_set -k || true'
+ExecStop=/bin/bash  -c 'for cpu in \$(seq 0 ${GB_PCORES_MAX}); do echo powersave  > /sys/devices/system/cpu/cpu\${cpu}/cpufreq/scaling_governor; done; cset set -d inference_set || true'
 
 [Install]
 WantedBy=multi-user.target
@@ -194,6 +338,7 @@ cmd_build() {
 
 cmd_install() {
     need_root install
+    detect_hardware
     check_deps
     cmd_build
 
@@ -206,14 +351,12 @@ cmd_install() {
 
     # modprobe defaults
     info "Writing /etc/modprobe.d/greenboost.conf ..."
-    cat > /etc/modprobe.d/greenboost.conf << 'MODEOF'
-# GreenBoost v2.3 — 3-tier pool: RTX 5070 VRAM + DDR4 + NVMe swap
-# Tier 1: physical_vram_gb=12   RTX 5070 (12 GB GDDR7)
-# Tier 2: virtual_vram_gb=51    DDR4 pool (80% of 64 GB, hugepages)
-#          safety_reserve_gb=12  always keep ≥12 GB free in RAM
-# Tier 3: nvme_swap_gb=576      Samsung 990 Evo Plus NVMe swap capacity
-#          nvme_pool_gb=512      GreenBoost soft cap on T3 allocations
-options greenboost physical_vram_gb=12 virtual_vram_gb=51 safety_reserve_gb=12 nvme_swap_gb=576 nvme_pool_gb=512
+    cat > /etc/modprobe.d/greenboost.conf << MODEOF
+# GreenBoost — 3-tier pool (auto-configured for detected hardware)
+# GPU   : ${GPU_NAME}  (${GB_PHYS} GB VRAM)
+# RAM   : ${RAM_TYPE}-${RAM_SPEED_MT}  (pool ${GB_VIRT} GB, reserve ${GB_RESERVE} GB)
+# NVMe  : swap ${GB_NVME_SWAP} GB
+options greenboost physical_vram_gb=${GB_PHYS} virtual_vram_gb=${GB_VIRT} safety_reserve_gb=${GB_RESERVE} nvme_swap_gb=${GB_NVME_SWAP} nvme_pool_gb=${GB_NVME_POOL} pcores_max_cpu=${GB_PCORES_MAX} golden_cpu_min=${GB_GOLDEN_MIN} golden_cpu_max=${GB_GOLDEN_MAX} pcores_only=${GB_PCORES_ONLY}
 MODEOF
 
     # profile.d helper
@@ -241,11 +384,16 @@ WRAPEOF
 
 cmd_load() {
     need_root load
-    local phys="${GPU_PHYS_GB:-12}"
-    local virt="${VIRT_VRAM_GB:-51}"
-    local res="${RESERVE_GB:-12}"
-    local nvme_sw="${NVME_SWAP_GB:-576}"
-    local nvme_pool="${NVME_POOL_GB:-512}"
+    detect_hardware
+    local phys="${GPU_PHYS_GB:-${GB_PHYS}}"
+    local virt="${VIRT_VRAM_GB:-${GB_VIRT}}"
+    local res="${RESERVE_GB:-${GB_RESERVE}}"
+    local nvme_sw="${NVME_SWAP_GB:-${GB_NVME_SWAP}}"
+    local nvme_pool="${NVME_POOL_GB:-${GB_NVME_POOL}}"
+    local pcores_max="${GB_PCORES_MAX}"
+    local golden_min="${GB_GOLDEN_MIN}"
+    local golden_max="${GB_GOLDEN_MAX}"
+    local pcores_only="${GB_PCORES_ONLY}"
 
     if lsmod | grep -q "^${DRIVER_NAME} "; then
         warn "Module already loaded — reloading..."
@@ -261,6 +409,10 @@ cmd_load() {
         safety_reserve_gb="$res"  \
         nvme_swap_gb="$nvme_sw"   \
         nvme_pool_gb="$nvme_pool" \
+        pcores_max_cpu="$pcores_max" \
+        golden_cpu_min="$golden_min" \
+        golden_cpu_max="$golden_max" \
+        pcores_only="$pcores_only" \
         || die "insmod failed — check: dmesg | tail -20"
 
     info "GreenBoost v2.3 loaded — 3-tier pool active!"
@@ -806,9 +958,9 @@ cmd_help() {
     echo ""
     echo "  Tier 1  RTX 5070 VRAM      12 GB   ~336 GB/s  [hot layers]"
     echo "  Tier 2  DDR4 pool          51 GB    ~50 GB/s  [cold layers, hugepages]"
-    echo "  Tier 3  NVMe swap         576 GB    ~1.8 GB/s  [frozen pages, swappable 4K]"
+    echo "  Tier 3  NVMe swap          64 GB    ~1.8 GB/s  [frozen pages, swappable 4K]"
     echo "          ─────────────────────────────────────"
-    echo "          Combined capacity  639 GB"
+    echo "          Combined capacity   75 GB (T3 expandable to 200+ GB)"
     echo ""
     echo "USAGE:  sudo ./greenboost_setup.sh <command>"
     echo ""
@@ -825,20 +977,22 @@ cmd_help() {
     echo "  tune-all    Run tune + tune-grub + tune-sysctl + tune-libs in sequence"
     echo "  install-sys-configs  Install Ollama env, NVMe udev, CPU governor, hugepages, sysctl"
     echo "  install-deps         Install all Ubuntu OS packages (build + CUDA + AI libs)"
-    echo "  setup-swap [GB]      Create/activate NVMe swap file (T3 tier, default 576 GB)"
-    echo "  full-install         Complete fresh-OS setup: deps+swap+build+install+configs+tune"
+    echo "  setup-swap [GB]      Create/activate NVMe swap (default: auto-sized, ~64 GB for target model)"
+    echo "  full-install [--owner-workstation]  Complete install — hardware auto-detected or owner preset"
     echo "  status      Show module status and 3-tier pool info"
     echo "  diagnose    Full health check — run this after reboot to verify everything works"
+    echo "  optimize-model [--model M] [--strategy tensorrt|lora|exllama|all]"
+    echo "               Optimize LLM for max speed: TRT-LLM, LoRA, ExLlamaV3"
     echo "  help        Show this help"
     echo ""
     echo "ENVIRONMENT (for load):"
     echo "  GPU_PHYS_GB=12     Physical VRAM in GB          (RTX 5070 default: 12)"
     echo "  VIRT_VRAM_GB=51    DDR4 pool size in GB         (default: 51, 80% of 64 GB)"
     echo "  RESERVE_GB=12      System RAM to keep free      (default: 12)"
-    echo "  NVME_SWAP_GB=576   NVMe swap capacity in GB     (default: 576)"
-    echo "  NVME_POOL_GB=512   GreenBoost T3 soft cap in GB (default: 512)"
+    echo "  NVME_SWAP_GB=64    NVMe swap capacity in GB     (default: 64, auto-detected)"
+    echo "  NVME_POOL_GB=58    GreenBoost T3 soft cap in GB (default: 58)"
     echo ""
-    echo "  Example: sudo VIRT_VRAM_GB=48 NVME_SWAP_GB=576 ./greenboost_setup.sh load"
+    echo "  Example: sudo VIRT_VRAM_GB=48 NVME_SWAP_GB=64 ./greenboost_setup.sh load"
     echo ""
     echo "CUDA SHIM (transparent DDR4 overflow via NVIDIA UVM):"
     echo "  Prerequisite  : sudo modprobe nvidia_uvm"
@@ -904,8 +1058,10 @@ cmd_install_deps() {
 
 cmd_setup_swap() {
     need_root setup-swap
-    local gb="${2:-576}"   # argument or default 576 GB
-    [[ "$1" == "setup-swap" ]] && gb="${2:-576}" || gb="${1:-576}"
+    detect_hardware 2>/dev/null  # populate GB_NVME_SWAP if not already set
+    local _default_swap="${GB_NVME_SWAP:-64}"
+    local gb="${2:-${_default_swap}}"
+    [[ "$1" == "setup-swap" ]] && gb="${2:-${_default_swap}}" || gb="${1:-${_default_swap}}"
     local swap_file="/swap_nvme.img"
     local swap_bytes=$(( gb * 1024 * 1024 * 1024 ))
 
@@ -968,10 +1124,25 @@ cmd_setup_swap() {
 cmd_full_install() {
     need_root full-install
 
-    info "╔══════════════════════════════════════════════════════════════╗"
-    info "║  GreenBoost v2.3 — Complete Fresh Install                   ║"
-    info "║  i9-14900KF | RTX 5070 OC | 64 GB DDR4 | Samsung 990 4 TB  ║"
-    info "╚══════════════════════════════════════════════════════════════╝"
+    # ── Hardware preset: --owner-workstation overrides auto-detection ────
+    local _owner_ws=0
+    for arg in "$@"; do
+        [[ "$arg" == "--owner-workstation" ]] && _owner_ws=1
+    done
+
+    if [[ $_owner_ws -eq 1 ]]; then
+        set_owner_workstation_params
+        info "╔══════════════════════════════════════════════════════════════╗"
+        info "║  GreenBoost — Owner-Workstation Install                     ║"
+        info "║  i9-14900KF | RTX 5070 OC | 64 GB DDR4-3600 | 4 TB NVMe   ║"
+        info "╚══════════════════════════════════════════════════════════════╝"
+    else
+        detect_hardware
+        info "╔══════════════════════════════════════════════════════════════╗"
+        info "║  GreenBoost — Dynamic Install (hardware auto-detected)      ║"
+        info "╚══════════════════════════════════════════════════════════════╝"
+        print_detected_hardware
+    fi
     echo ""
 
     # 1/7 — OS dependencies
@@ -979,9 +1150,9 @@ cmd_full_install() {
     cmd_install_deps
     echo ""
 
-    # 2/7 — NVMe swap (T3 tier, 576 GB)
-    info "[2/7] Setting up NVMe swap file (T3 tier, 576 GB)..."
-    cmd_setup_swap 576
+    # 2/7 — NVMe swap (T3 tier, auto-sized)
+    info "[2/7] Setting up NVMe swap file (T3 tier, ${GB_NVME_SWAP} GB)..."
+    cmd_setup_swap "${GB_NVME_SWAP}"
     echo ""
 
     # 3/7 — Build + install kernel module + CUDA shim
@@ -1006,38 +1177,48 @@ cmd_full_install() {
     cmd_tune_grub
     echo ""
 
-    # 7/7 — ExLlamaV3 with GreenBoost patches (optional)
-    info "[7/7] ExLlamaV3 + GreenBoost integration..."
-    local exllama_dir="/home/ferran/Dev/llibreries/greenboost_enhanced/exllamav3"
+    # 7/7 — ExLlamaV3 + Python tools (kvpress, modelopt, unsloth)
+    info "[7/7] Setting up Python venv + ExLlamaV3 + inference tools..."
+    local exllama_dir="$MODULE_DIR/libraries/exllamav3"
+    local venv_dir="/opt/greenboost/venv"
 
-    if [[ -d "$exllama_dir" ]]; then
-        info "Found ExLlamaV3 at $exllama_dir"
+    # Ensure dependencies
+    apt-get install -y liburing-dev python3-venv python3-pip -q 2>/dev/null || true
 
-        # Install system-wide shared location for the python library
-        local system_exllama_dir="/opt/greenboost/exllamav3"
-        info "Copying ExLlamaV3 to system shared directory ($system_exllama_dir)..."
-        mkdir -p /opt/greenboost
-        cp -r "$exllama_dir" /opt/greenboost/
-
-        # Ensure liburing-dev is present (io_uring stloader)
-        apt-get install -y liburing-dev python3-venv 2>/dev/null || true
-        # Python 3.12+ (Ubuntu 24.04+) is "externally managed" — use a venv
-        local venv_dir="/opt/greenboost/venv"
-        if [[ ! -d "$venv_dir" ]]; then
-            info "Creating Python venv at $venv_dir..."
-            python3 -m venv "$venv_dir" || die "python3 -m venv failed — install python3-venv"
-        fi
-
-        # Make the system directory accessible to all users
-        chmod -R 755 /opt/greenboost
-
-        STLOADER_USE_URING=1 "$venv_dir/bin/pip" install -e "$system_exllama_dir" --no-build-isolation \
-            && info "ExLlamaV3 installed in $venv_dir" \
-            || warn "ExLlamaV3 install failed — run manually: STLOADER_USE_URING=1 $venv_dir/bin/pip install -e $system_exllama_dir --no-build-isolation"
-        info "To use ExLlamaV3: source $venv_dir/bin/activate"
-    else
-        warn "ExLlamaV3 not found at $exllama_dir. Place it there then re-run."
+    # Create venv if absent
+    if [[ ! -d "$venv_dir" ]]; then
+        info "Creating Python venv at $venv_dir ..."
+        python3 -m venv "$venv_dir" || die "python3 -m venv failed — install python3-venv"
     fi
+    chmod -R 755 /opt/greenboost
+
+    # Install ExLlamaV3 from bundled library
+    if [[ -d "$exllama_dir" ]]; then
+        info "Installing ExLlamaV3 from $exllama_dir ..."
+        STLOADER_USE_URING=1 "$venv_dir/bin/pip" install -e "$exllama_dir" \
+            --no-build-isolation -q \
+            && info "ExLlamaV3 installed." \
+            || warn "ExLlamaV3 install failed — re-run: STLOADER_USE_URING=1 $venv_dir/bin/pip install -e $exllama_dir --no-build-isolation"
+    else
+        warn "ExLlamaV3 not found at $exllama_dir — skipping."
+    fi
+
+    # Install kvpress (runtime KV cache compression, no retraining)
+    if "$venv_dir/bin/python" -c "import kvpress" &>/dev/null 2>&1; then
+        info "kvpress already installed."
+    else
+        info "Installing kvpress ..."
+        "$venv_dir/bin/pip" install kvpress -q \
+            && info "kvpress installed." \
+            || warn "kvpress install failed — run: $venv_dir/bin/pip install kvpress"
+    fi
+
+    # Install core ML tools used by greenboost-ptq.py and greenboost-lora-train.py
+    info "Installing trl, datasets (used by LoRA tools) ..."
+    "$venv_dir/bin/pip" install trl datasets -q 2>/dev/null || true
+
+    info "Python venv ready: $venv_dir"
+    info "Activate with:  source $venv_dir/bin/activate"
     echo ""
 
     info "╔══════════════════════════════════════════════════════════════╗"
@@ -1053,6 +1234,298 @@ cmd_full_install() {
     echo ""
     info "If models still appear stuck (CPU fallback), diagnose will show the issue."
     info "For live Ollama logs: journalctl -u ollama -f"
+}
+
+# ---- optimize-model ----------------------------------------------------
+# Optimize the target LLM for maximum inference speed on this workstation.
+# Strategies:
+#   1. TensorRT-LLM  — NVIDIA's highest-throughput inference engine (GPU)
+#   2. LoRA adapters — apply lightweight adaptation without full fine-tuning
+#   3. ExLlamaV3     — token-streaming with GreenBoost-aware KV cache
+#
+# Usage:
+#   sudo ./greenboost_setup.sh optimize-model
+#   sudo ./greenboost_setup.sh optimize-model --model glm-4.7-flash:q8_0
+#   sudo ./greenboost_setup.sh optimize-model --strategy tensorrt
+#   sudo ./greenboost_setup.sh optimize-model --strategy lora --adapter /path/to/adapter
+
+cmd_optimize_model() {
+    detect_hardware
+
+    local model="glm-4.7-flash:q8_0"
+    local strategy="status"
+    local lora_adapter=""
+    local lora_data=""
+    local quant="fp8"
+    local compression="0.5"
+    local hf_model=""
+
+    # Parse args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model)       model="$2";       shift 2 ;;
+            --hf-model)    hf_model="$2";    shift 2 ;;
+            --strategy)    strategy="$2";    shift 2 ;;
+            --adapter)     lora_adapter="$2"; shift 2 ;;
+            --data)        lora_data="$2";   shift 2 ;;
+            --quant)       quant="$2";       shift 2 ;;
+            --compression) compression="$2"; shift 2 ;;
+            optimize-model) shift ;;
+            *) shift ;;
+        esac
+    done
+
+    _sect_opt() { echo -e "\n${BLU}── $* ──${NC}"; }
+    local venv_dir="/opt/greenboost/venv"
+    local exllama_dir="$MODULE_DIR/libraries/exllamav3"
+    local trt_edge_dir="$MODULE_DIR/libraries/TensorRT-Edge-LLM"
+    local modelopt_dir="$MODULE_DIR/libraries/Model-Optimizer"
+    local kvcompress_dir="$MODULE_DIR/libraries/kvcompress"
+
+    info "╔══════════════════════════════════════════════════════════════╗"
+    info "║  GreenBoost — Model Optimization                            ║"
+    info "║  Copyright (C) 2024-2026 Ferran Duarri                     ║"
+    info "╚══════════════════════════════════════════════════════════════╝"
+    info "Model    : $model"
+    info "GPU      : ${GPU_NAME}  (${GB_PHYS} GB VRAM)"
+    info "Strategy : $strategy"
+    echo ""
+
+    # ── status: show available strategies and library state ──────────────
+    if [[ "$strategy" == "status" || "$strategy" == "all" ]]; then
+        _sect_opt "Library Status"
+        local ok="${GRN}[ok]${NC}" miss="${YLW}[missing]${NC}"
+
+        echo -e "  ExLlamaV3 (KV cache offload, EXL3 inference):"
+        [[ -d "$exllama_dir" ]] \
+            && echo -e "    $ok  $exllama_dir" \
+            || echo -e "    $miss  $exllama_dir"
+        local elv3_cache="$exllama_dir/exllamav3/cache/greenboost.py"
+        [[ -f "$elv3_cache" ]] \
+            && echo -e "    $ok  CacheLayer_greenboost (GreenBoost DDR4 KV cache bridge)" \
+            || echo -e "    $miss  CacheLayer_greenboost not found"
+
+        echo ""
+        echo -e "  KVCompress / kvpress (runtime KV cache compression):"
+        [[ -d "$kvcompress_dir" ]] \
+            && echo -e "    $ok  $kvcompress_dir" \
+            || echo -e "    $miss  $kvcompress_dir"
+
+        echo ""
+        echo -e "  Model-Optimizer / ModelOpt (FP8/INT4 post-training quantization):"
+        [[ -d "$modelopt_dir" ]] \
+            && echo -e "    $ok  $modelopt_dir" \
+            || echo -e "    $miss  $modelopt_dir"
+
+        echo ""
+        echo -e "  TensorRT-Edge-LLM (quantize+export to TRT engine):"
+        [[ -d "$trt_edge_dir" ]] \
+            && echo -e "    $ok  $trt_edge_dir" \
+            || echo -e "    $miss  $trt_edge_dir"
+
+        echo ""
+        echo -e "  LoRA fine-tuning (Unsloth, fits 30B in 12 GB VRAM):"
+        [[ -d "$MODULE_DIR/libraries/LoRA" ]] \
+            && echo -e "    $ok  $MODULE_DIR/libraries/LoRA" \
+            || echo -e "    $miss  $MODULE_DIR/libraries/LoRA"
+
+        echo ""
+        echo -e "  Python venv: ${venv_dir}"
+        [[ -d "$venv_dir" ]] && echo -e "    $ok" || echo -e "    $miss  run: sudo $0 full-install"
+
+        echo ""
+        info "Run a specific strategy:"
+        info "  sudo $0 optimize-model --strategy exllama   [--hf-model THUDM/glm-4.7-flash-hf]"
+        info "  sudo $0 optimize-model --strategy kvcompress [--compression 0.5]"
+        info "  sudo $0 optimize-model --strategy modelopt-ptq --hf-model THUDM/glm-4.7-flash-hf"
+        info "  sudo $0 optimize-model --strategy tensorrt-edge --hf-model THUDM/glm-4.7-flash-hf"
+        info "  sudo $0 optimize-model --strategy lora --hf-model THUDM/glm-4.7-flash-hf --data /path/data.jsonl"
+        [[ "$strategy" == "status" ]] && return 0
+    fi
+
+    # ── Ollama runtime tuning (always applied for non-status strategies) ──
+    if [[ "$strategy" != "status" ]]; then
+        _sect_opt "Ollama Runtime Tuning"
+        local svc="/etc/systemd/system/ollama.service"
+        if [[ -f "$svc" ]]; then
+            local changed=0
+            local pcore_count=$(( GB_PCORES_MAX + 1 ))
+            if ! grep -q "OLLAMA_NUM_THREADS" "$svc"; then
+                sed -i "/LD_PRELOAD/a Environment=\"OLLAMA_NUM_THREADS=${pcore_count}\"" "$svc"
+                info "  OLLAMA_NUM_THREADS=${pcore_count} (P-cores only, max freq)"
+                changed=1
+            fi
+            if ! grep -q "OLLAMA_GPU_OVERHEAD" "$svc"; then
+                sed -i "/LD_PRELOAD/a Environment=\"OLLAMA_GPU_OVERHEAD=268435456\"" "$svc"
+                info "  OLLAMA_GPU_OVERHEAD=256MB (more VRAM for model layers)"
+                changed=1
+            fi
+            if ! grep -q "OLLAMA_MAX_QUEUE" "$svc"; then
+                sed -i "/LD_PRELOAD/a Environment=\"OLLAMA_MAX_QUEUE=1\"" "$svc"
+                info "  OLLAMA_MAX_QUEUE=1 (dedicate all GPU to one request)"
+                changed=1
+            fi
+            [[ $changed -eq 1 ]] && systemctl daemon-reload \
+                && info "  Ollama updated — restart: sudo systemctl restart ollama" \
+                || info "  Ollama already tuned"
+        fi
+    fi
+
+    # ── ExLlamaV3 + GreenBoost DDR4 KV cache ─────────────────────────────
+    if [[ "$strategy" == "exllama" || "$strategy" == "all" ]]; then
+        _sect_opt "ExLlamaV3 + GreenBoost DDR4 KV Cache"
+        if [[ ! -d "$exllama_dir" ]]; then
+            warn "  ExLlamaV3 not found at $exllama_dir"
+        else
+            info "  ExLlamaV3: $exllama_dir"
+            info "  CacheLayer_greenboost: routes KV cache → Tier 2 DDR4 DMA-BUF pages"
+            info "  Benefit: 131K context without VRAM OOM (KV cache in DDR4, not VRAM)"
+            echo ""
+            # Install if needed
+            if [[ -d "$venv_dir" ]]; then
+                if ! "$venv_dir/bin/python" -c "import exllamav3" &>/dev/null 2>&1; then
+                    info "  Installing ExLlamaV3 ..."
+                    "$venv_dir/bin/pip" install -e "$exllama_dir" --no-build-isolation -q \
+                        && info "  ExLlamaV3 installed" \
+                        || warn "  ExLlamaV3 install failed — run manually"
+                else
+                    info "  ExLlamaV3: already installed ✓"
+                fi
+            fi
+            echo ""
+            info "  Usage (interactive chat with GreenBoost KV cache):"
+            info "    $MODULE_DIR/tools/greenboost-exllama.sh --model /path/to/model"
+            info ""
+            info "  Usage (OpenAI-compatible server on port 8080):"
+            info "    $MODULE_DIR/tools/greenboost-exllama.sh --model /path/to/model --mode server"
+            echo ""
+            info "  Convert HF model to EXL3 (4× smaller, faster decode):"
+            info "    $MODULE_DIR/tools/greenboost-exllama.sh --model THUDM/glm-4.7-flash-hf --exl3-convert --bpw 4.0"
+            info "  After EXL3 (4bpw, ~8 GB): fits in VRAM — no DDR4 overflow needed"
+        fi
+    fi
+
+    # ── KVCompress / kvpress ──────────────────────────────────────────────
+    if [[ "$strategy" == "kvcompress" || "$strategy" == "all" ]]; then
+        _sect_opt "KV Cache Compression (kvpress)"
+        if [[ ! -d "$kvcompress_dir" ]]; then
+            warn "  kvcompress not found at $kvcompress_dir"
+        else
+            info "  kvpress: runtime KV cache compression (no retraining required)"
+            info "  Compression ratio $compression → keeps ${compression} of KV cache"
+            info "  Methods: ExpAttn (recommended), SnapKV, KnormPress"
+            info "  Benefit: 2× longer effective context at same VRAM"
+            echo ""
+            info "  Benchmark on this hardware:"
+            info "    $MODULE_DIR/tools/greenboost-kvpress.sh --benchmark --model ${hf_model:-THUDM/glm-4.7-flash-hf}"
+            info ""
+            info "  Single inference:"
+            info "    $MODULE_DIR/tools/greenboost-kvpress.sh \\"
+            info "      --model ${hf_model:-THUDM/glm-4.7-flash-hf} \\"
+            info "      --compression $compression --method ExpAttn \\"
+            info "      --prompt 'Explain quantum entanglement'"
+        fi
+    fi
+
+    # ── ModelOpt PTQ ──────────────────────────────────────────────────────
+    if [[ "$strategy" == "modelopt-ptq" || "$strategy" == "all" ]]; then
+        _sect_opt "Post-Training Quantization (ModelOpt ${quant})"
+        if [[ ! -d "$modelopt_dir" ]]; then
+            warn "  Model-Optimizer not found at $modelopt_dir"
+        else
+            info "  ModelOpt PTQ: no retraining — calibration only (~5-30 min)"
+            info "  Scheme: $quant  |  Model: ${hf_model:-$model}"
+            info "  Result: 2-4× smaller model → less Tier 2 DDR4 pressure"
+            echo ""
+            if [[ -n "$hf_model" ]]; then
+                info "  Running PTQ on $hf_model ..."
+                local ptq_out="/opt/greenboost/models/$(basename "${hf_model}")-${quant}"
+                local py="${venv_dir}/bin/python"
+                [[ -x "$py" ]] || py="python3"
+                "$py" "$MODULE_DIR/tools/greenboost-ptq.py" \
+                    --model "$hf_model" \
+                    --quant "$quant" \
+                    --output "$ptq_out" \
+                    --create-modelfile \
+                    || warn "  PTQ failed — check output above"
+            else
+                info "  To quantize a model:"
+                info "    sudo $0 optimize-model --strategy modelopt-ptq --hf-model THUDM/glm-4.7-flash-hf"
+                info "    sudo $0 optimize-model --strategy modelopt-ptq --hf-model THUDM/glm-4.7-flash-hf --quant int4_awq"
+                info ""
+                info "  Manual: $MODULE_DIR/tools/greenboost-ptq.py --model THUDM/glm-4.7-flash-hf"
+            fi
+        fi
+    fi
+
+    # ── TensorRT-Edge-LLM ─────────────────────────────────────────────────
+    if [[ "$strategy" == "tensorrt-edge" || "$strategy" == "all" ]]; then
+        _sect_opt "TensorRT-Edge-LLM Export"
+        if [[ ! -d "$trt_edge_dir" ]]; then
+            warn "  TensorRT-Edge-LLM not found at $trt_edge_dir"
+        else
+            info "  TRT-Edge-LLM: quantize + export to TRT engine (no retraining)"
+            info "  Supports: FP8, NVFP4, INT4-AWQ"
+            local cc
+            cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
+            info "  GPU CC: ${cc:-unknown}  (Blackwell RTX 50xx needs TRT-Edge >= 0.5)"
+            echo ""
+            if [[ -n "$hf_model" ]]; then
+                local trt_out="/opt/greenboost/trt-engines/$(basename "${hf_model}")-${quant}"
+                info "  Quantizing $hf_model → $trt_out ..."
+                local py="${venv_dir}/bin/python"
+                [[ -x "$py" ]] || py="python3"
+                if "$py" -c "import tensorrt_edgellm" &>/dev/null 2>&1; then
+                    mkdir -p "$trt_out"
+                    "$py" -m tensorrt_edgellm.scripts.quantize_llm \
+                        --model_dir="$hf_model" \
+                        --output_dir="${trt_out}/quantized" \
+                        --quantization_scheme="$quant" \
+                        || warn "  Quantization failed — see output above"
+                else
+                    warn "  tensorrt_edgellm not installed in venv"
+                    info "  Install: $venv_dir/bin/pip install -e $trt_edge_dir"
+                    info "  Then re-run: sudo $0 optimize-model --strategy tensorrt-edge --hf-model $hf_model"
+                fi
+            else
+                info "  To export a model to TRT engine:"
+                info "    sudo $0 optimize-model --strategy tensorrt-edge --hf-model THUDM/glm-4.7-flash-hf"
+                info "    sudo $0 optimize-model --strategy tensorrt-edge --hf-model /path/to/model --quant nvfp4"
+            fi
+        fi
+    fi
+
+    # ── LoRA fine-tuning ──────────────────────────────────────────────────
+    if [[ "$strategy" == "lora" ]]; then
+        _sect_opt "LoRA Fine-tuning (Unsloth)"
+        info "  Trains LoRA adapter on custom data. Fits 30B in 12 GB VRAM via 4-bit base."
+        info "  Peak VRAM: ~11.3 GB  |  Training time: ~2-4h on RTX 5070"
+        echo ""
+        if [[ -n "$hf_model" && -n "$lora_data" ]]; then
+            local py="${venv_dir}/bin/python"
+            [[ -x "$py" ]] || py="python3"
+            "$py" "$MODULE_DIR/tools/greenboost-lora-train.py" \
+                --model "$hf_model" \
+                --data  "$lora_data" \
+                --output /opt/greenboost/models/lora-adapter \
+                || warn "  LoRA training failed — see output above"
+        else
+            info "  To fine-tune:"
+            info "    sudo $0 optimize-model --strategy lora \\"
+            info "      --hf-model THUDM/glm-4.7-flash-hf \\"
+            info "      --data /path/to/training_data.jsonl"
+            info ""
+            info "  Data format (JSONL):"
+            info "    {\"instruction\": \"...\", \"input\": \"...\", \"output\": \"...\"}"
+            info ""
+            info "  After training, Ollama GGUF is auto-created:"
+            info "    ollama create glm-lora -f /opt/greenboost/models/lora-adapter/gguf/Modelfile"
+        fi
+    fi
+
+    echo ""
+    info "Optimization complete."
+    info "Run benchmark: sudo $0 diagnose"
 }
 
 # ---- diagnose ----------------------------------------------------------
@@ -1533,7 +2006,7 @@ case "$COMMAND" in
     install-sys-configs) cmd_install_sys_configs ;;
     install-deps)        cmd_install_deps       ;;
     setup-swap)          cmd_setup_swap "$@"    ;;
-    full-install)        cmd_full_install       ;;
+    full-install)        cmd_full_install "$@"  ;;
     tune)               cmd_tune               ;;
     tune-grub)          cmd_tune_grub          ;;
     tune-sysctl)        cmd_tune_sysctl        ;;
@@ -1541,6 +2014,7 @@ case "$COMMAND" in
     tune-all)           cmd_tune_all           ;;
     status)             cmd_status             ;;
     diagnose)           cmd_diagnose           ;;
+    optimize-model)      cmd_optimize_model "$@" ;;
     help|--help|-h)     cmd_help               ;;
     *) die "Unknown command: '$COMMAND'  — use: $0 help" ;;
 esac

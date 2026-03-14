@@ -82,8 +82,8 @@ static int virtual_vram_gb   = 51;  /* 80% of 64 GB DDR4               */
 static int safety_reserve_gb = 12;  /* always keep ≥12 GB free in RAM  */
 
 /* Tier 3 */
-static int nvme_swap_gb      = 576; /* NVMe swap capacity (Samsung 990) */
-static int nvme_pool_gb      = 512; /* GreenBoost soft cap on T3 use    */
+static int nvme_swap_gb      = 64;  /* NVMe swap capacity (T3 overflow safety net) */
+static int nvme_pool_gb      = 58;  /* GreenBoost soft cap on T3 use    */
 
 /* CPU topology (i9-14900KF on ASRock B760M-ITX/D4) */
 static int pcores_max_cpu    = 15;  /* last P-core logical CPU (0-15)   */
@@ -108,11 +108,11 @@ MODULE_PARM_DESC(safety_reserve_gb,
 
 module_param(nvme_swap_gb,      int, 0444);
 MODULE_PARM_DESC(nvme_swap_gb,
-	"Tier 3: Total NVMe swap capacity in GB — default: 576 (Samsung 990 EVO Plus)");
+	"Tier 3: Total NVMe swap capacity in GB — default: 64 (T3 overflow safety net)");
 
 module_param(nvme_pool_gb,      int, 0444);
 MODULE_PARM_DESC(nvme_pool_gb,
-	"Tier 3: GreenBoost soft cap on T3 allocations in GB — default: 512");
+	"Tier 3: GreenBoost soft cap on T3 allocations in GB — default: 58");
 
 module_param(pcores_max_cpu,    int, 0444);
 MODULE_PARM_DESC(pcores_max_cpu,

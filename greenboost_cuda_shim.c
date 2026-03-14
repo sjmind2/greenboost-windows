@@ -11,7 +11,7 @@
  *
  * ENVIRONMENT VARIABLES:
  *   GREENBOOST_USE_DMA_BUF    1 = use DMA-BUF import (default), 0 = UVM only
- *   GREENBOOST_VRAM_HEADROOM_MB  keep ≥ this many MB free in VRAM (default 1024)
+ *   GREENBOOST_VRAM_HEADROOM_MB  keep ≥ this many MB free in VRAM (default 2048)
  *   GREENBOOST_DEBUG          1 = verbose logging to stderr
  *
  * PREREQUISITES:
@@ -281,7 +281,7 @@ static pfn_cuMemHostGetDevicePointer       real_cuMemHostGetDevicePointer;
 static pfn_cuMemPrefetchAsync              real_cuMemPrefetchAsync;
 static pfn_cudaMemPrefetchAsync            real_cudaMemPrefetchAsync;
 
-static size_t vram_headroom_bytes   = 1024ULL * 1024 * 1024; /* 1 GB */
+static size_t vram_headroom_bytes   = 2048ULL * 1024 * 1024; /* 2 GB */
 static size_t gb_virtual_vram_bytes = 51ULL * 1024 * 1024 * 1024; /* DDR4 pool — reported to CUDA */
 /* DMA-BUF mmap+register is the primary path now. */
 static int    gb_use_dmabuf         = 1;

@@ -1,10 +1,11 @@
-/* SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2024-2026 Ferran Duarri. Dual-licensed: GPL v2 + Commercial.
  * GreenBoost v2.3 — Shared IOCTL definitions (kernel + userspace)
  *
  * Works with both #include <linux/ioctl.h> (kernel) and <sys/ioctl.h> (user).
  *
  * Author  : Ferran Duarri
- * License : GPL v2
+ * License : GPL v2 (open-source) / Commercial — see LICENSE
  */
 #ifndef GREENBOOST_IOCTL_H
 #define GREENBOOST_IOCTL_H
