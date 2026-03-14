@@ -1182,8 +1182,8 @@ cmd_full_install() {
     local exllama_dir="$MODULE_DIR/libraries/exllamav3"
     local venv_dir="/opt/greenboost/venv"
 
-    # Ensure dependencies
-    apt-get install -y liburing-dev python3-venv python3-pip -q 2>/dev/null || true
+    # Ensure dependencies (cargo/rustfmt needed for pydantic-core on Python 3.14)
+    apt-get install -y liburing-dev python3-venv python3-pip cargo rustfmt -q 2>/dev/null || true
 
     # Create venv if absent
     if [[ ! -d "$venv_dir" ]]; then
@@ -1197,36 +1197,42 @@ cmd_full_install() {
         "$venv_dir/bin/python" -m ensurepip --upgrade \
             || die "ensurepip failed — install python3-pip: apt-get install -y python3-pip"
     fi
-    # Always upgrade pip + install build tools (setuptools/wheel required by
-    # --no-build-isolation; they are NOT included in fresh venvs on Ubuntu 26.04)
-    "$venv_dir/bin/python" -m pip install --upgrade pip setuptools wheel -q
+    # Upgrade pip + install build tools.
+    # maturin is required to compile pydantic-core (Rust) on Python 3.14 where
+    # no pre-built wheels exist. setuptools/wheel cover C-extension packages.
+    "$venv_dir/bin/python" -m pip install --upgrade pip setuptools wheel maturin -q
 
     chmod -R 755 /opt/greenboost
 
-    # Install ExLlamaV3 from bundled library
+    # Install ExLlamaV3 from bundled library.
+    # Do NOT use --no-build-isolation: pip needs to manage the maturin build
+    # environment for pydantic-core and other Rust-based transitive deps.
     if [[ -d "$exllama_dir" ]]; then
         info "Installing ExLlamaV3 from $exllama_dir ..."
+        warn "This may take 10-30 min on first run (flash-attn CUDA compilation)."
         STLOADER_USE_URING=1 "$venv_dir/bin/python" -m pip install -e "$exllama_dir" \
-            --no-build-isolation \
             && info "ExLlamaV3 installed." \
-            || warn "ExLlamaV3 install failed — re-run: STLOADER_USE_URING=1 $venv_dir/bin/python -m pip install -e $exllama_dir --no-build-isolation"
+            || warn "ExLlamaV3 install failed — re-run: STLOADER_USE_URING=1 $venv_dir/bin/python -m pip install -e $exllama_dir"
     else
         warn "ExLlamaV3 not found at $exllama_dir — skipping."
     fi
 
-    # Install kvpress (runtime KV cache compression, no retraining)
+    # Install trl + datasets>=3 first (trl requires datasets>=3.0.0).
+    # Must happen BEFORE kvpress to avoid kvpress downgrading datasets to <3.
+    info "Installing trl, datasets>=3 (used by LoRA tools) ..."
+    "$venv_dir/bin/python" -m pip install "trl" "datasets>=3.0.0" -q 2>/dev/null || true
+
+    # Install kvpress (runtime KV cache compression, no retraining).
+    # kvpress pins datasets<3 which conflicts with trl. Install with --no-deps
+    # to skip the stale version constraint; its runtime deps are already present.
     if "$venv_dir/bin/python" -c "import kvpress" &>/dev/null 2>&1; then
         info "kvpress already installed."
     else
         info "Installing kvpress ..."
-        "$venv_dir/bin/python" -m pip install kvpress \
-            && info "kvpress installed." \
-            || warn "kvpress install failed — run: $venv_dir/bin/python -m pip install kvpress"
+        "$venv_dir/bin/python" -m pip install kvpress --no-deps -q \
+            && info "kvpress installed (--no-deps; trl provides datasets>=3)." \
+            || warn "kvpress install failed — run: $venv_dir/bin/python -m pip install kvpress --no-deps"
     fi
-
-    # Install core ML tools used by greenboost-ptq.py and greenboost-lora-train.py
-    info "Installing trl, datasets (used by LoRA tools) ..."
-    "$venv_dir/bin/python" -m pip install trl datasets -q 2>/dev/null || true
 
     info "Python venv ready: $venv_dir"
     info "Activate with:  source $venv_dir/bin/activate"
