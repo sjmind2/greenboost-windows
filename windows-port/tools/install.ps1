@@ -21,7 +21,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $GreenBoostVersion = "2.3.0"
-$RegPath = "HKLM:\SOFTWARE\GreenBoost"
+$RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\GreenBoost\Parameters"
 $DriverName = "GreenBoost"
 $ShimDll = "greenboost_cuda.dll"
 $DriverSys = "greenboost_win.sys"
@@ -178,15 +178,24 @@ function Install-GreenBoostDriver {
         }
     }
 
+    $svc = Get-Service -Name $DriverName -ErrorAction SilentlyContinue
     $existingDevice = & pnputil /enum-devices /connected 2>$null | Select-String -Pattern "GreenBoost"
-    if ($existingDevice) {
-        Write-Status "Device already exists, checking service..."
-        $svc = Get-Service -Name $DriverName -ErrorAction SilentlyContinue
-        if ($svc -and $svc.Status -eq "Running") {
+    
+    if ($existingDevice -and $svc) {
+        $sourceFile = Get-Item $sysPath
+        $driverStoreFiles = Get-ChildItem "C:\Windows\System32\DriverStore\FileRepository\greenboost*" -Recurse -Filter "*.sys" -ErrorAction SilentlyContinue
+        $newestInstalled = $driverStoreFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        
+        if ($newestInstalled -and $sourceFile.LastWriteTime -gt $newestInstalled.LastWriteTime) {
+            Write-Status "Source driver is newer than installed version, forcing update..."
+            Write-Status "  Source: $($sourceFile.LastWriteTime)"
+            Write-Status "  Installed: $($newestInstalled.LastWriteTime)"
+            Uninstall-GreenBoostDriver
+            Start-Sleep -Seconds 1
+        } elseif ($svc.Status -eq "Running") {
             Write-Status "Driver already installed and running"
             return $true
-        }
-        if ($svc) {
+        } elseif ($svc) {
             Start-Service -Name $DriverName -ErrorAction SilentlyContinue
             Write-Status "Driver service started"
             return $true
@@ -305,11 +314,17 @@ function Uninstall-GreenBoostDriver {
     & sc.exe delete $DriverName 2>&1 | Out-Null
 
     Write-Status "Finding and removing driver packages..."
-    $driverPackages = pnputil /enum-drivers 2>$null | Select-String -Pattern "greenboost_win.inf" -Context 5,0
+    $driverOutput = pnputil /enum-drivers 2>$null
     $oemInfs = @()
-    foreach ($match in $driverPackages) {
-        if ($match -match "(?:发布名称|Published Name)\s*:\s*(oem\d+\.inf)") {
-            $oemInfs += $Matches[1]
+    $lines = $driverOutput -split "`r?`n"
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match "greenboost_win.inf") {
+            for ($j = [Math]::Max(0, $i - 5); $j -lt $i; $j++) {
+                if ($lines[$j] -match "(?:发布名称|Published Name)\s*:\s*(oem\d+\.inf)") {
+                    $oemInfs += $Matches[1]
+                    break
+                }
+            }
         }
     }
 

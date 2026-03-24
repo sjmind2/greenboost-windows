@@ -20,7 +20,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$RegPath = "HKLM:\SOFTWARE\GreenBoost"
+$RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\GreenBoost\Parameters"
 $DriverName = "GreenBoost"
 
 function Write-Status($msg) { Write-Host "[GreenBoost] $msg" -ForegroundColor Green }
