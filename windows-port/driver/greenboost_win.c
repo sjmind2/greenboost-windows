@@ -101,12 +101,8 @@ NTSTATUS GbReadConfig(VOID)
 
 VOID GbQueryMemoryStatus(_Out_ PULONG64 TotalBytes, _Out_ PULONG64 AvailBytes)
 {
-    /*
-     * In kernel mode, query system memory via ZwQuerySystemInformation.
-     * SystemBasicInformation gives total physical pages.
-     * SystemPerformanceInformation gives available pages.
-     */
     SYSTEM_BASIC_INFORMATION basicInfo = { 0 };
+    SYSTEM_PERFORMANCE_INFORMATION perfInfo = { 0 };
     NTSTATUS status;
     ULONG retLen;
 
@@ -118,14 +114,11 @@ VOID GbQueryMemoryStatus(_Out_ PULONG64 TotalBytes, _Out_ PULONG64 AvailBytes)
     if (NT_SUCCESS(status)) {
         *TotalBytes = (ULONG64)basicInfo.NumberOfPhysicalPages * basicInfo.PageSize;
 
-        /*
-         * For available memory, use MmAvailablePages if accessible,
-         * or fall back to a conservative estimate.
-         * MmAvailablePages is an exported kernel variable on most
-         * Windows versions.
-         */
-        ULONG64 availPages = MmAvailablePages;
-        *AvailBytes = availPages * basicInfo.PageSize;
+        status = ZwQuerySystemInformation(SystemPerformanceInformation,
+                                          &perfInfo, sizeof(perfInfo), &retLen);
+        if (NT_SUCCESS(status)) {
+            *AvailBytes = (ULONG64)perfInfo.AvailablePages * basicInfo.PageSize;
+        }
     }
 }
 
@@ -398,7 +391,7 @@ PGB_BUF_WIN GbAllocTier2(_In_ SIZE_T Size, _In_ ULONG Flags)
         sysAddr = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
         if (!sysAddr) {
             MmFreePagesFromMdl(mdl);
-            ExFreeIoMdl(mdl);
+            IoFreeMdl(mdl);
             ExFreePoolWithTag(buf, GB_TAG);
             gb_err("MmGetSystemAddressForMdlSafe failed");
             return NULL;

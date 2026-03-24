@@ -9,6 +9,7 @@
 #   - Windows 10/11 x64
 #   - NVIDIA GPU with CUDA 12+ driver
 #   - Test signing enabled for development: bcdedit /set testsigning on
+#   - Run build.ps1 first to generate artifacts in tools\outputs
 
 [CmdletBinding()]
 param(
@@ -23,10 +24,12 @@ $GreenBoostVersion = "2.3.0"
 $RegPath = "HKLM:\SOFTWARE\GreenBoost"
 $DriverName = "GreenBoost"
 $ShimDll = "greenboost_cuda.dll"
+$DriverSys = "greenboost_win.sys"
+$DriverInf = "greenboost_win.inf"
+$TestExe = "test_ioctl.exe"
 
-# ----------------------------------------------------------------
-#  Utility functions
-# ----------------------------------------------------------------
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$outputsDir = Join-Path $scriptDir "outputs"
 
 function Write-Status($msg) { Write-Host "[GreenBoost] $msg" -ForegroundColor Green }
 function Write-Warn($msg)   { Write-Host "[GreenBoost] WARNING: $msg" -ForegroundColor Yellow }
@@ -37,10 +40,6 @@ function Test-Admin {
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
-
-# ----------------------------------------------------------------
-#  Hardware detection
-# ----------------------------------------------------------------
 
 function Get-GpuInfo {
     Write-Status "Detecting NVIDIA GPU..."
@@ -85,17 +84,12 @@ function Get-NvmeInfo {
     return 0
 }
 
-# ----------------------------------------------------------------
-#  Configuration
-# ----------------------------------------------------------------
-
 function Set-GreenBoostConfig {
     param(
         [int]$PhysicalVramGb,
         [int]$SystemRamGb
     )
 
-    # Compute optimal settings (matching Linux defaults)
     $virtualVramGb = [math]::Floor($SystemRamGb * 0.8)
     $safetyReserveGb = [math]::Max(12, [math]::Floor($SystemRamGb * 0.19))
     $nvmeSwapGb = 64
@@ -110,7 +104,6 @@ function Set-GreenBoostConfig {
     Write-Status "  Alloc Threshold  : $thresholdMb MB"
     Write-Status "  Combined Model   : $($PhysicalVramGb + $virtualVramGb + $nvmeSwapGb) GB"
 
-    # Write to registry
     if (-not (Test-Path $RegPath)) {
         New-Item -Path $RegPath -Force | Out-Null
     }
@@ -126,21 +119,26 @@ function Set-GreenBoostConfig {
     Write-Status "Registry configuration written to $RegPath"
 }
 
-# ----------------------------------------------------------------
-#  Driver installation
-# ----------------------------------------------------------------
-
 function Install-GreenBoostDriver {
-    $driverDir = Join-Path $PSScriptRoot "..\driver"
-    $infPath = Join-Path $driverDir "greenboost_win.inf"
-    $sysPath = Join-Path $driverDir "greenboost_win.sys"
+    $sysPath = Join-Path $outputsDir $DriverSys
+    $infPath = Join-Path $outputsDir $DriverInf
+
+    Write-Status "Looking for driver artifacts in: $outputsDir"
+
+    if (-not (Test-Path $sysPath)) {
+        Write-Err "Driver SYS not found: $sysPath"
+        Write-Err "Please run build.ps1 first to generate outputs."
+        return $false
+    }
 
     if (-not (Test-Path $infPath)) {
         Write-Err "Driver INF not found: $infPath"
         return $false
     }
 
-    # Check test signing
+    Write-Status "  SYS: $sysPath"
+    Write-Status "  INF: $infPath"
+
     $bcdOutput = & bcdedit /enum "{current}" 2>$null
     if ($bcdOutput -match "testsigning\s+Yes") {
         Write-Status "Test signing is enabled"
@@ -153,7 +151,6 @@ function Install-GreenBoostDriver {
         }
     }
 
-    # Install driver
     Write-Status "Installing driver..."
     try {
         $result = & pnputil /add-driver $infPath /install 2>&1
@@ -163,7 +160,6 @@ function Install-GreenBoostDriver {
         return $false
     }
 
-    # Start the driver service
     try {
         Start-Service -Name $DriverName -ErrorAction SilentlyContinue
         Write-Status "Driver service started"
@@ -180,32 +176,40 @@ function Uninstall-GreenBoostDriver {
 
     Write-Status "Removing driver..."
     try {
-        $result = & pnputil /delete-driver greenboost_win.inf /uninstall /force 2>&1
+        $result = & pnputil /delete-driver oem0.inf /uninstall /force 2>&1
         Write-Status "pnputil output: $result"
     } catch {
         Write-Warn "Driver removal may require manual cleanup"
     }
+
+    $infPath = Join-Path $outputsDir $DriverInf
+    if (Test-Path $infPath) {
+        try {
+            $result = & pnputil /delete-driver $DriverInf /uninstall /force 2>&1
+            Write-Status "pnputil output: $result"
+        } catch {
+            Write-Warn "Driver removal may require manual cleanup"
+        }
+    }
 }
 
-# ----------------------------------------------------------------
-#  Shim installation
-# ----------------------------------------------------------------
-
 function Install-GreenBoostShim {
-    $shimDir = Join-Path $PSScriptRoot "..\shim"
-    $shimDll = Join-Path $shimDir $ShimDll
+    $shimDllPath = Join-Path $outputsDir $ShimDll
 
-    if (-not (Test-Path $shimDll)) {
-        Write-Warn "Shim DLL not found at $shimDll (build required)"
-        return
+    Write-Status "Looking for shim artifacts in: $outputsDir"
+
+    if (-not (Test-Path $shimDllPath)) {
+        Write-Err "Shim DLL not found: $shimDllPath"
+        Write-Err "Please run build.ps1 first to generate outputs."
+        return $false
     }
 
-    # Detect LM Studio
+    Write-Status "  DLL: $shimDllPath"
+
     $lmStudioPath = Join-Path $env:USERPROFILE ".cache\lm-studio"
     if (Test-Path $lmStudioPath) {
         Write-Status "LM Studio detected at $lmStudioPath"
 
-        # Create launcher script
         $launcherPath = Join-Path $lmStudioPath "greenboost_launch.bat"
         $lmStudioExe = Get-ChildItem -Path $lmStudioPath -Filter "LM Studio.exe" -Recurse | Select-Object -First 1
         if ($lmStudioExe) {
@@ -214,25 +218,27 @@ function Install-GreenBoostShim {
 REM GreenBoost LM Studio Launcher
 REM Injects greenboost_cuda.dll into LM Studio for extended VRAM
 set GREENBOOST_DEBUG=0
-withdll.exe /d:"$shimDll" "$($lmStudioExe.FullName)"
+withdll.exe /d:"$shimDllPath" "$($lmStudioExe.FullName)"
 "@
             Set-Content -Path $launcherPath -Value $content
             Write-Status "LM Studio launcher created: $launcherPath"
         }
     }
 
-    # Detect Ollama
     $ollamaPath = (Get-Command ollama -ErrorAction SilentlyContinue)
     if ($ollamaPath) {
         Write-Status "Ollama detected at $($ollamaPath.Source)"
-        Write-Status "Launch with: withdll.exe /d:$shimDll ollama serve"
+        Write-Status "Launch with: withdll.exe /d:$shimDllPath ollama serve"
     }
 
-    Write-Status "Shim DLL location: $shimDll"
+    Write-Status ""
+    Write-Status "Shim DLL location: $shimDllPath"
     Write-Status "Injection methods:"
-    Write-Status "  1. withdll.exe /d:$shimDll <your-app.exe>"
+    Write-Status "  1. withdll.exe /d:$shimDllPath <your-app.exe>"
     Write-Status "  2. Use greenboost_launch.bat for LM Studio"
     Write-Status "  3. Set GREENBOOST_DEBUG=1 for verbose logging"
+
+    return $true
 }
 
 function Uninstall-GreenBoostShim {
@@ -244,10 +250,6 @@ function Uninstall-GreenBoostShim {
     }
 }
 
-# ----------------------------------------------------------------
-#  Main
-# ----------------------------------------------------------------
-
 if (-not (Test-Admin)) {
     Write-Err "This script requires Administrator privileges."
     Write-Err "Right-click PowerShell and select 'Run as Administrator'."
@@ -255,6 +257,13 @@ if (-not (Test-Admin)) {
 }
 
 Write-Status "=== GreenBoost v$GreenBoostVersion Windows Installer ==="
+Write-Status "Outputs directory: $outputsDir"
+
+if (-not (Test-Path $outputsDir)) {
+    Write-Err "Outputs directory not found: $outputsDir"
+    Write-Err "Please run build.ps1 first to generate outputs."
+    exit 1
+}
 
 if ($Uninstall) {
     Write-Status "Uninstalling GreenBoost..."
@@ -268,26 +277,25 @@ if ($Uninstall) {
     exit 0
 }
 
-# Detect hardware
 $gpu = Get-GpuInfo
 $ramGb = Get-SystemRamGb
 $cpu = Get-CpuInfo
 $nvmeGb = Get-NvmeInfo
 
-# Write configuration
 Set-GreenBoostConfig -PhysicalVramGb $gpu.VramGb -SystemRamGb $ramGb
 
-# Install driver
 if (-not $SkipDriver) {
     $driverOk = Install-GreenBoostDriver
     if (-not $driverOk) {
-        Write-Warn "Driver installation incomplete — shim will still work in passthrough mode"
+        Write-Warn "Driver installation incomplete - shim will still work in passthrough mode"
     }
 }
 
-# Install shim
 if (-not $SkipShim) {
-    Install-GreenBoostShim
+    $shimOk = Install-GreenBoostShim
+    if (-not $shimOk) {
+        Write-Warn "Shim installation incomplete"
+    }
 }
 
 Write-Status ""
@@ -296,5 +304,3 @@ Write-Status "Combined model capacity: $($gpu.VramGb + [math]::Floor($ramGb * 0.
 Write-Status "  T1 GPU VRAM : $($gpu.VramGb) GB"
 Write-Status "  T2 DDR4     : $([math]::Floor($ramGb * 0.8)) GB"
 Write-Status "  T3 NVMe     : 64 GB"
-Write-Status ""
-Write-Status "Run .\diagnose.ps1 to verify the installation"

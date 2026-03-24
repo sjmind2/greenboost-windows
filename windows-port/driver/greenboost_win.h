@@ -17,6 +17,124 @@
 #include "greenboost_ioctl_win.h"
 
 /* ------------------------------------------------------------------ */
+/*  System Information Types (undocumented but stable)                  */
+/*                                                                      */
+/*  These structures are not officially documented for kernel mode.     */
+/*  winternl.h (user mode) defines them with opaque Reserved fields.    */
+/*  The layouts below are based on reverse engineering and are stable   */
+/*  across Windows versions. Use at your own risk.                      */
+/* ------------------------------------------------------------------ */
+typedef struct _KAPC_STATE {
+    LIST_ENTRY ApcListHead;
+    struct _KPROCESS *Process;
+    UCHAR InProgressFlags;
+    UCHAR KernelApcPending;
+    UCHAR UserApcPending;
+} KAPC_STATE, *PKAPC_STATE;
+
+
+typedef enum _SYSTEM_INFORMATION_CLASS {
+    SystemBasicInformation = 0,
+    SystemPerformanceInformation = 2,
+    SystemMemoryUsageInformation = 88
+} SYSTEM_INFORMATION_CLASS;
+
+typedef struct _SYSTEM_BASIC_INFORMATION {
+    ULONG Reserved;
+    ULONG TimerResolution;
+    ULONG PageSize;
+    ULONG NumberOfPhysicalPages;
+    ULONG LowestPhysicalPageNumber;
+    ULONG HighestPhysicalPageNumber;
+    ULONG AllocationGranularity;
+    ULONG_PTR MinimumUserModeAddress;
+    ULONG_PTR MaximumUserModeAddress;
+    ULONG_PTR ActiveProcessorsAffinityMask;
+    CCHAR NumberOfProcessors;
+} SYSTEM_BASIC_INFORMATION, *PSYSTEM_BASIC_INFORMATION;
+
+typedef struct _SYSTEM_PERFORMANCE_INFORMATION {
+    LARGE_INTEGER IdleProcessTime;
+    LARGE_INTEGER IoReadTransferCount;
+    LARGE_INTEGER IoWriteTransferCount;
+    LARGE_INTEGER IoOtherTransferCount;
+    ULONG IoReadOperationCount;
+    ULONG IoWriteOperationCount;
+    ULONG IoOtherOperationCount;
+    ULONG AvailablePages;
+    ULONG CommittedPages;
+    ULONG CommitLimit;
+    ULONG PeakCommitment;
+    ULONG PageFaultCount;
+    ULONG CopyOnWriteCount;
+    ULONG TransitionCount;
+    ULONG CacheTransitionCount;
+    ULONG DemandZeroCount;
+    ULONG PageReadCount;
+    ULONG PageReadIoCount;
+    ULONG CacheReadCount;
+    ULONG CacheIoCount;
+    ULONG DirtyPagesWriteCount;
+    ULONG DirtyWriteIoCount;
+    ULONG MappedPagesWriteCount;
+    ULONG MappedWriteIoCount;
+    ULONG PagedPoolPages;
+    ULONG NonPagedPoolPages;
+    ULONG SparePagesCount;
+    ULONG PageFilePagesWritten;
+    ULONG PageFilePages;
+    ULONG AvailablePagesFile;
+    ULONG SystemCachePage;
+    ULONG PagedPoolPage;
+    ULONG SystemDriverPage;
+    ULONG FastReadNoWait;
+    ULONG FastReadWait;
+    ULONG FastReadResourceMiss;
+    ULONG FastReadNotPossible;
+    ULONG FastMdlReadNoWait;
+    ULONG FastMdlReadWait;
+    ULONG FastMdlReadResourceMiss;
+    ULONG FastMdlReadNotPossible;
+    ULONG MapDataNoWait;
+    ULONG MapDataWait;
+    ULONG MapDataNoWaitMiss;
+    ULONG MapDataWaitMiss;
+    ULONG PinMappedDataCount;
+    ULONG PinReadNoWait;
+    ULONG PinReadWait;
+    ULONG PinReadNoWaitMiss;
+    ULONG PinReadWaitMiss;
+    ULONG CopyReadNoWait;
+    ULONG CopyReadWait;
+    ULONG CopyReadNoWaitMiss;
+    ULONG CopyReadWaitMiss;
+    ULONG MdlReadNoWait;
+    ULONG MdlReadWait;
+    ULONG MdlReadNoWaitMiss;
+    ULONG MdlReadWaitMiss;
+    ULONG ReadAheadMisses;
+    ULONG ReadAheadPages;
+    ULONG ReadAheadSyncReads;
+    ULONG FastReadResourceMisses;
+    ULONG DataFlushes;
+    ULONG DataPages;
+    ULONG ContextSwitches;
+    ULONG FirstLevelTbFills;
+    ULONG SecondLevelTbFills;
+    ULONG SystemCalls;
+} SYSTEM_PERFORMANCE_INFORMATION, *PSYSTEM_PERFORMANCE_INFORMATION;
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQuerySystemInformation(
+    _In_ SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    _Out_writes_bytes_opt_(SystemInformationLength) PVOID SystemInformation,
+    _In_ ULONG SystemInformationLength,
+    _Out_opt_ PULONG ReturnLength
+);
+
+/* ------------------------------------------------------------------ */
 /*  Constants                                                           */
 /* ------------------------------------------------------------------ */
 
